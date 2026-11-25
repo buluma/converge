@@ -152,7 +152,7 @@ jobs:
       - run: bun run build
         env:
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
-          SENTRY_ORG: ${{ vars.SENTRY_ORG }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
 
   a11y:
     needs: build
