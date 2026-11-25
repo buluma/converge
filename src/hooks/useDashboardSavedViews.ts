@@ -1,0 +1,325 @@
+"use client";
+
+import { useCallback, useEffect, useState } from "react";
+
+import { matchesView } from "@/src/lib/issue-utils";
+import type { SavedView, SavedViewColumnKey } from "@/src/types/dashboard";
+
+const SAVED_VIEWS_KEY = "nrcc.savedViews.v1";
+
+export interface ViewSnapshot {
+  statusFilter: string;
+  priorityFilter: string;
+  search: string;
+  sort: string;
+  assignedToMe: boolean;
+  visibleColumns: SavedViewColumnKey[];
+  statusIds: number[];
+  priorityIds: number[];
+  hasGithubLinks: boolean;
+  hasAttachments: boolean;
+  dueInDays?: number | "overdue";
+  updatedAfter?: string;
+  selectedProject: string | null;
+  showFavoritesOnly: boolean;
+}
+
+export interface UseDashboardSavedViewsResult {
+  savedViews: SavedView[];
+  activeViewId: string | null;
+  activeViewDirty: boolean;
+  setActiveViewId: (id: string | null) => void;
+  viewDraftName: string;
+  setViewDraftName: (name: string) => void;
+  saveView: (
+    snapshot: ViewSnapshot,
+    fallbackName: string,
+    nameOverride?: string,
+  ) => Promise<{ view: SavedView; replaced: boolean }>;
+  deleteView: (viewId: string) => Promise<SavedView | undefined>;
+  reorderViews: (viewIds: string[]) => Promise<void>;
+  clearActiveIfDiverged: (snapshot: ViewSnapshot) => void;
+}
+
+function isSavedView(value: unknown): value is SavedView {
+  if (!value || typeof value !== "object") return false;
+  const view = value as Partial<SavedView>;
+  return (
+    typeof view.id === "string" &&
+    typeof view.name === "string" &&
+    typeof view.statusFilter === "string" &&
+    typeof view.priorityFilter === "string" &&
+    typeof view.search === "string" &&
+    typeof view.sort === "string" &&
+    typeof view.assignedToMe === "boolean"
+  );
+}
+
+function readLegacyViews(): SavedView[] {
+  try {
+    const raw = window.localStorage.getItem(SAVED_VIEWS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    return Array.isArray(parsed) ? parsed.filter(isSavedView) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function responseJson<T>(response: Response): Promise<T> {
+  if (!response.ok) {
+    const body = (await response.json().catch(() => null)) as {
+      error?: string;
+    } | null;
+    throw new Error(
+      body?.error || `Saved view request failed: ${response.status}`,
+    );
+  }
+  return response.json() as Promise<T>;
+}
+
+export function useDashboardSavedViews(): UseDashboardSavedViewsResult {
+  const [savedViews, setSavedViews] = useState<SavedView[]>([]);
+  const [activeViewId, setActiveViewId] = useState<string | null>(null);
+  const [activeViewDirty, setActiveViewDirty] = useState(false);
+  const [viewDraftName, setViewDraftName] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function hydrate() {
+      const legacyViews = readLegacyViews();
+      try {
+        const data = await responseJson<{ views: SavedView[] }>(
+          await fetch("/api/saved-views", { cache: "no-store" }),
+        );
+        if (cancelled) return;
+
+        if (data.views.length > 0 || legacyViews.length === 0) {
+          setSavedViews(data.views);
+          return;
+        }
+
+        const migrated = await responseJson<{ views: SavedView[] }>(
+          await fetch("/api/saved-views/import", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              views: legacyViews.map((view) => ({
+                name: view.name,
+                filters: {
+                  statusFilter: view.statusFilter,
+                  priorityFilter: view.priorityFilter,
+                  search: view.search,
+                  sort: view.sort,
+                  assignedToMe: view.assignedToMe,
+                  visibleColumns: view.visibleColumns,
+                  statusIds: view.statusIds ?? [],
+                  priorityIds: view.priorityIds ?? [],
+                  hasGithubLinks: view.hasGithubLinks ?? false,
+                  hasAttachments: view.hasAttachments ?? false,
+                  dueInDays: view.dueInDays,
+                  updatedAfter: view.updatedAfter,
+                  selectedProject: view.selectedProject ?? null,
+                  showFavoritesOnly: view.showFavoritesOnly ?? false,
+                },
+              })),
+            }),
+          }),
+        );
+
+        if (!cancelled) {
+          window.localStorage.removeItem(SAVED_VIEWS_KEY);
+          setSavedViews(migrated.views);
+        }
+      } catch {
+        // The import can fail because another tab already migrated these
+        // same legacy views (a 409 "already exist" race) — in that case the
+        // server now has the authoritative list, so re-fetch it instead of
+        // falling back to stale legacy ids that were never actually
+        // persisted (saveView/deleteView against them would 404). Only fall
+        // back to the legacy snapshot if that re-fetch itself fails.
+        if (cancelled) return;
+        try {
+          const data = await responseJson<{ views: SavedView[] }>(
+            await fetch("/api/saved-views", { cache: "no-store" }),
+          );
+          if (cancelled) return;
+          if (data.views.length > 0) {
+            // Another tab's import won the race — its views are now the
+            // authoritative server state, so the local snapshot is done.
+            window.localStorage.removeItem(SAVED_VIEWS_KEY);
+            setSavedViews(data.views);
+          } else {
+            // Genuinely still empty server-side (a real failure, not a
+            // race) — keep the legacy snapshot in localStorage so a later
+            // hydration can retry the import instead of losing it.
+            setSavedViews(legacyViews);
+          }
+        } catch {
+          if (!cancelled) setSavedViews(legacyViews);
+        }
+      }
+    }
+
+    void hydrate();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const clearActiveIfDiverged = useCallback(
+    (snapshot: ViewSnapshot) => {
+      if (!activeViewId) {
+        setActiveViewDirty(false);
+        return;
+      }
+      const active = savedViews.find((view) => view.id === activeViewId);
+      if (!active) {
+        setActiveViewId(null);
+        setActiveViewDirty(false);
+        return;
+      }
+      setActiveViewDirty(!matchesView(active, snapshot));
+    },
+    [activeViewId, savedViews],
+  );
+
+  const saveView = useCallback(
+    async (snapshot: ViewSnapshot, fallbackName: string, nameOverride?: string) => {
+      const name = nameOverride?.trim() || viewDraftName.trim() || fallbackName;
+      const existing = savedViews.find(
+        (view) => view.name.toLowerCase() === name.toLowerCase(),
+      );
+      const previousViews = savedViews;
+      const previousActiveViewId = activeViewId;
+      const previousActiveViewDirty = activeViewDirty;
+      const optimisticView: SavedView = {
+        id: existing?.id ?? `local-${Date.now()}`,
+        name,
+        ...snapshot,
+        position: existing?.position ?? savedViews.length,
+      };
+
+      setSavedViews((current) =>
+        existing
+          ? current.map((view) =>
+              view.id === existing.id ? optimisticView : view,
+            )
+          : [...current, optimisticView],
+      );
+      setActiveViewId(optimisticView.id);
+      setActiveViewDirty(false);
+      setViewDraftName("");
+
+      try {
+        const endpoint = existing
+          ? `/api/saved-views/${existing.id}`
+          : "/api/saved-views";
+        const response = await fetch(endpoint, {
+          method: existing ? "PATCH" : "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name, filters: snapshot }),
+        });
+        const data = await responseJson<{ view: SavedView }>(response);
+        setSavedViews((current) =>
+          existing
+            ? current.map((view) =>
+                view.id === existing.id ? data.view : view,
+              )
+            : current.map((view) =>
+                view.id === optimisticView.id ? data.view : view,
+              ),
+        );
+        setActiveViewId(data.view.id);
+        return { view: data.view, replaced: Boolean(existing) };
+      } catch (error) {
+        setSavedViews(previousViews);
+        setActiveViewId(previousActiveViewId);
+        setActiveViewDirty(previousActiveViewDirty);
+        throw error;
+      }
+    },
+    [activeViewDirty, activeViewId, savedViews, viewDraftName],
+  );
+
+  const deleteView = useCallback(
+    async (viewId: string) => {
+      const target = savedViews.find((view) => view.id === viewId);
+      if (!target) return undefined;
+      const previousViews = savedViews;
+      const previousActiveViewId = activeViewId;
+      const previousActiveViewDirty = activeViewDirty;
+      setSavedViews((current) => current.filter((view) => view.id !== viewId));
+      if (activeViewId === viewId) {
+        setActiveViewId(null);
+        setActiveViewDirty(false);
+      }
+
+      try {
+        await responseJson<{ ok: true }>(
+          await fetch(`/api/saved-views/${viewId}`, { method: "DELETE" }),
+        );
+        return target;
+      } catch (error) {
+        setSavedViews(previousViews);
+        setActiveViewId(previousActiveViewId);
+        setActiveViewDirty(previousActiveViewDirty);
+        throw error;
+      }
+    },
+    [activeViewDirty, activeViewId, savedViews],
+  );
+
+  const reorderViews = useCallback(
+    async (viewIds: string[]) => {
+      const previousViews = savedViews;
+      const positions = new Map(viewIds.map((id, index) => [id, index]));
+      if (
+        // A duplicate id collapses in the Map, so also check the raw array
+        // length against the deduped size — otherwise a malformed list like
+        // [a, b, a] (every existing id present, but with a dupe) would slip
+        // through: positions.size and savedViews.length can coincidentally
+        // match even though the reorder is bogus.
+        viewIds.length !== savedViews.length ||
+        positions.size !== viewIds.length ||
+        savedViews.some((view) => !positions.has(view.id))
+      ) {
+        throw new Error("Saved view reorder does not match the current views");
+      }
+
+      setSavedViews((current) =>
+        current
+          .map((view) => ({ ...view, position: positions.get(view.id) }))
+          .sort((left, right) => (left.position ?? 0) - (right.position ?? 0)),
+      );
+
+      try {
+        await responseJson(
+          await fetch("/api/saved-views/reorder", {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ viewIds }),
+          }),
+        );
+      } catch (error) {
+        setSavedViews(previousViews);
+        throw error;
+      }
+    },
+    [savedViews],
+  );
+
+  return {
+    savedViews,
+    activeViewId,
+    activeViewDirty,
+    setActiveViewId,
+    viewDraftName,
+    setViewDraftName,
+    saveView,
+    deleteView,
+    reorderViews,
+    clearActiveIfDiverged,
+  };
+}

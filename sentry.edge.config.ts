@@ -1,0 +1,45 @@
+// This file configures the initialization of Sentry for edge features (middleware, edge routes, and so on).
+// The config you add here will be used whenever one of the edge features is loaded.
+// Note that this config is unrelated to the Vercel Edge Runtime and is also required when running locally.
+// https://docs.sentry.io/platforms/javascript/guides/nextjs/
+
+import * as Sentry from "@sentry/nextjs";
+import { getSentryDataCollection } from "@/src/lib/sentry-data-collection";
+
+const isProduction = process.env.NODE_ENV === "production";
+
+function boolFromEnv(key: string, fallback: boolean): boolean {
+  const value = process.env[key];
+  if (!value) {
+    return fallback;
+  }
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+  return fallback;
+}
+
+function numberFromEnv(key: string, fallback: number): number {
+  const value = Number(process.env[key] ?? fallback);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+const tracesSampleRate = numberFromEnv("SENTRY_TRACES_SAMPLE_RATE", isProduction ? 0.1 : 0);
+const enableConsoleLogging = boolFromEnv("SENTRY_ENABLE_CONSOLE_LOGGING", false);
+const sendDefaultPii = boolFromEnv("SENTRY_SEND_DEFAULT_PII", false);
+
+const integrations = [];
+if (enableConsoleLogging) {
+  integrations.push(Sentry.consoleLoggingIntegration({ levels: ["log", "warn", "error"] }));
+}
+
+Sentry.init({
+  dsn: process.env.SENTRY_DSN ?? process.env.NEXT_PUBLIC_SENTRY_DSN,
+  integrations,
+  tracesSampleRate,
+  dataCollection: getSentryDataCollection(sendDefaultPii),
+});

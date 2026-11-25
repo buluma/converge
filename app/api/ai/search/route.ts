@@ -1,0 +1,129 @@
+import { getOllamaClient } from "@/src/lib/ollama";
+import { getLLMProviderManager } from "@/src/lib/llm-provider";
+import { createSearchMessages, parseJsonResponse, type SearchResponse } from "@/src/lib/ai-prompt";
+import { env } from "@/src/lib/env";
+import { prisma } from "@/src/lib/db";
+import { getAuthenticatedUserId } from "@/src/lib/auth";
+import { jsonError } from "@/src/lib/http";
+import { trackFailure } from "@/src/lib/telemetry";
+
+export const runtime = "nodejs";
+
+export async function POST(request: Request) {
+  if (!env.enableAiFeatures || !env.aiSearchEnabled) {
+    return jsonError("AI search is disabled", 403);
+  }
+
+  // Always scope to the authenticated user. The issue set is fed verbatim to
+  // the LLM and returned, so an unauthenticated or cross-user query would leak
+  // every ticket's subject/description — the userId must come from the session,
+  // never from the request body.
+  const userId = await getAuthenticatedUserId();
+  if (!userId) {
+    return jsonError("Unauthorized", 401);
+  }
+
+  try {
+    const body = await request.json();
+    const { query, limit = 10 } = body;
+
+    if (!query) {
+      return jsonError("query is required", 400);
+    }
+
+    const issues = await prisma.issue.findMany({
+      where: { userId },
+      take: 50, // Limit for AI processing
+      orderBy: { updatedOnRemote: "desc" },
+    });
+
+    if (issues.length === 0) {
+      return Response.json({
+        results: [],
+        insights: "No issues found to search through.",
+        modelUsed: "none",
+      });
+    }
+
+    const client = getLLMProviderManager();
+    const messages = createSearchMessages(
+      query,
+      issues.map((issue) => ({
+        id: issue.id,
+        redmineIssueId: issue.redmineIssueId,
+        subject: issue.subject,
+        description: issue.description,
+        projectName: issue.projectName,
+        tracker: issue.tracker,
+        priority: issue.priority,
+        statusId: issue.statusId,
+        statusName: issue.statusName,
+        assignedToName: issue.assignedToName,
+        dueDate: issue.dueDate?.toISOString() ?? null,
+        doneRatio: issue.doneRatio,
+        updatedOn: (issue.lastActivityAt ?? issue.updatedOnRemote).toISOString(),
+      }))
+    );
+
+    // Try primary model, fallback on error
+    let result;
+    try {
+      result = client.getProvider() === "ollama"
+        ? { ...(await getOllamaClient().chatWithFallback(messages, { stream: false })), provider: "ollama" as const }
+        : await client.chat(messages, { stream: false });
+    } catch (error) {
+      return jsonError(
+        `AI search failed: ${error instanceof Error ? error.message : "Unknown error"}`,
+        503
+      );
+    }
+
+    // Parse JSON response
+    const parsed = parseJsonResponse<SearchResponse>(result.content);
+
+    if (!parsed) {
+      // If parsing failed, return basic response
+      return Response.json({
+        results: issues.slice(0, limit).map((issue) => ({
+          issueId: issue.id,
+          relevance: 0.5,
+          explanation: result.content.substring(0, 200),
+        })),
+        insights: "Could not parse AI response",
+        modelUsed: result.model,
+        usedFallback: ("usedFallback" in result && result.usedFallback) || (result.provider === "ollama" && client.getProvider() !== "ollama"),
+        rawResponse: true,
+      });
+    }
+
+    // Enrich results with actual issue data
+    const enrichedResults = parsed.results.slice(0, limit).map((r) => {
+      const issue = issues.find((i) => i.id === r.issueId);
+      return {
+        ...r,
+        issue: issue
+          ? {
+              id: issue.id,
+              redmineIssueId: issue.redmineIssueId,
+              subject: issue.subject,
+              statusName: issue.statusName,
+              projectName: issue.projectName,
+            }
+          : null,
+      };
+    });
+
+    return Response.json({
+      results: enrichedResults,
+      insights: parsed.insights,
+      modelUsed: result.model,
+      usedFallback: ("usedFallback" in result && result.usedFallback) || (result.provider === "ollama" && client.getProvider() !== "ollama"),
+    });
+  } catch (error) {
+    trackFailure({ event: "ai.search.failed", error, metricName: "ai_search_failed" });
+    return jsonError(
+      `Failed to search: ${error instanceof Error ? error.message : "Unknown error"}`,
+      500
+    );
+  }
+}

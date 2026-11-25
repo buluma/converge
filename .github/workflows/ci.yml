@@ -1,0 +1,235 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+# A new push on the same branch/PR cancels whatever CI run is already
+# in flight for it — no point finishing a run against code that's
+# already been superseded. workflow_dispatch runs get their own
+# per-run group (via github.run_id) so manual triggers never cancel
+# each other or a concurrent push-triggered run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: actions/cache@v6
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+      - run: bun install --frozen-lockfile
+      - run: bun run lint
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: actions/cache@v6
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+      - run: bun install --frozen-lockfile
+      - run: bun run audit
+
+  typecheck:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: actions/cache@v6
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+
+  test:
+    needs: typecheck
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: file:./test.db
+      APP_ENCRYPTION_KEY: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
+      SESSION_SECRET: ci-test-secret
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: actions/cache@v6
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+      - run: bun install --frozen-lockfile
+      - run: bunx prisma generate --schema=prisma/schema.dev.sqlite.prisma
+      - run: bun run test
+
+  postgres-schema:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: converge
+          POSTGRES_PASSWORD: converge
+          POSTGRES_DB: converge
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U converge -d converge"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://converge:converge@localhost:5432/converge
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: actions/cache@v6
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+      - run: bun install --frozen-lockfile
+      - run: bunx prisma validate --schema=prisma/schema.prisma
+      - run: bunx prisma db push --schema=prisma/schema.prisma
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: redmine
+    env:
+      DATABASE_URL: file:./test.db
+      APP_ENCRYPTION_KEY: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
+      SESSION_SECRET: ci-build-secret
+      NEXT_TELEMETRY_DISABLED: 1
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: actions/cache@v6
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+      - uses: actions/cache@v6
+        with:
+          path: .next/cache
+          key: ${{ runner.os }}-next-${{ hashFiles('bun.lock') }}-${{ hashFiles('src/**', 'app/**', 'next.config.ts') }}
+          restore-keys: |
+            ${{ runner.os }}-next-${{ hashFiles('bun.lock') }}-
+      - run: bun install --frozen-lockfile
+      - run: bunx prisma generate --schema=prisma/schema.dev.sqlite.prisma
+      - run: bun run build
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: ${{ vars.SENTRY_ORG }}
+
+  a11y:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: actions/cache@v6
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+      - run: bun install --frozen-lockfile
+      - run: bunx playwright install --with-deps chromium
+      - run: bunx prisma generate --schema=prisma/schema.dev.sqlite.prisma
+      - run: bunx prisma db push --schema=prisma/schema.dev.sqlite.prisma
+        env:
+          DATABASE_URL: file:./test.db
+      - run: bun run test:a11y
+        env:
+          DATABASE_URL: file:./test.db
+          APP_ENCRYPTION_KEY: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
+          SESSION_SECRET: ci-axe-secret
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: playwright-a11y-results
+          path: |
+            playwright-report/
+            test-results/
+          if-no-files-found: ignore
+
+  e2e:
+    needs: a11y
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - name: smoke
+            spec: e2e/smoke.spec.ts
+            session_secret: ci-smoke-secret
+          - name: auth-csrf
+            spec: e2e/auth-csrf.spec.ts
+            session_secret: ci-auth-csrf-secret
+          - name: external-api
+            spec: e2e/external-api.spec.ts
+            session_secret: ci-e2e-secret
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: actions/cache@v6
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+      - run: bun install --frozen-lockfile
+      - run: bunx playwright install --with-deps chromium
+      - run: bunx prisma db push --schema=prisma/schema.dev.sqlite.prisma
+        env:
+          DATABASE_URL: file:./test.db
+      - run: bunx playwright test ${{ matrix.suite.spec }}
+        env:
+          DATABASE_URL: file:./test.db
+          APP_ENCRYPTION_KEY: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
+          SESSION_SECRET: ${{ matrix.suite.session_secret }}
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: playwright-${{ matrix.suite.name }}-results
+          path: |
+            playwright-report/
+            test-results/
+          if-no-files-found: ignore

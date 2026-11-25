@@ -1,0 +1,30 @@
+# Converge Documentation
+
+Welcome to the documentation for Converge. This documentation is intended to help developers and users understand the project, its architecture, and how to use it.
+
+## Table of Contents
+
+- **[Project Overview](./project-overview.md):** A high-level overview of the project, its features, and the technology stack.
+- **[System Architecture](./system-architecture.md):** A description of the system architecture, components, and data flow.
+- **[Deployment Guide](./deployment-guide.md):** Instructions for setting up the application for local development and deployment.
+- **[API Reference](./api-reference.md):** API routes, request contracts, and response behavior.
+- **[External Tickets API](./external-api.md):** REST API for n8n, Zapier, and external integrations.
+- **[Webhooks](./webhooks.md):** Configure outgoing webhooks for external system integrations.
+- **[Slack Integration](./slack-integration.md):** Configure Slack for reading messages and sending Redmine updates.
+- **[Tailscale Aperture](./aperture.md):** Private LLM gateway configuration and usage.
+- **[Code Standards](./code-standards.md):** The coding standards and conventions used in the project.
+- **[Telemetry Conventions](./telemetry.md):** Standards for logs and metrics naming, tagging, and route instrumentation patterns.
+- **[Memory Profiling Guide](./perf-memory.md):** Repeatable process for measuring and reducing runtime memory usage.
+- **[Sync Scripts](./sync-scripts.md):** Operational scripts for syncing issues, users, enumerations, and maintenance tasks.
+- **[Codebase Summary](./codebase-summary.md):** A summary of the codebase structure.
+- **[Design Guidelines](./design-guidelines.md):** The design guidelines and UI/UX specifications.
+
+## Features & Components
+
+- **[Internationalization (i18n)](./i18n.md):** Multilingual support with 12 languages, translation usage, and how to add new languages.
+- **[Push Notifications](./push-notifications.md):** Browser push notification setup, VAPID configuration, and notification triggers.
+- **[Offline Sync Queue](./offline-sync.md):** IndexedDB-based offline-first architecture with Background Sync API.
+
+## Security & Access
+
+- **[RBAC](./rbac.md):** Role-based access control — Admin, Editor, User, Viewer roles, permission matrix, and role management.

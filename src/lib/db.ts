@@ -1,0 +1,252 @@
+import path from "node:path";
+import { PrismaBetterSqlite3 } from "@prisma/adapter-better-sqlite3";
+import { PrismaPg } from "@prisma/adapter-pg";
+import { PrismaClient } from "@/src/generated/prisma/client";
+import { env } from "@/src/lib/env";
+import { trackFailure } from "@/src/lib/telemetry";
+
+declare global {
+  var prisma: PrismaClient | undefined;
+}
+
+function buildPrismaUrl(rawUrl: string): string {
+  if (rawUrl.startsWith("file:") || rawUrl.startsWith("sqlite:")) {
+    // PrismaBetterSqlite3 only strips a leading `file:` and passes the rest to
+    // better-sqlite3 as a literal filename, so `sqlite:` must become `file:` and
+    // Prisma 6-era query params (connection_limit, socket_timeout, ...) must be
+    // dropped or they end up in the filename.
+    const scheme = rawUrl.startsWith("file:") ? "file:" : "sqlite:";
+    const remainder = rawUrl.slice(scheme.length);
+    const queryIndex = remainder.indexOf("?");
+    const databasePath = queryIndex === -1 ? remainder : remainder.slice(0, queryIndex);
+    if (!databasePath || databasePath === ":memory:" || path.isAbsolute(databasePath)) {
+      return `file:${databasePath}`;
+    }
+
+    return `file:${path.resolve(process.cwd(), databasePath)}`;
+  }
+
+  // Keep pool timeout explicit; connection_limit can be overridden via env in deployments when needed.
+  if (!rawUrl.startsWith("postgres://") && !rawUrl.startsWith("postgresql://")) {
+    return rawUrl;
+  }
+
+  try {
+    const url = new URL(rawUrl);
+    if (!url.searchParams.has("pool_timeout")) {
+      url.searchParams.set("pool_timeout", "30");
+    }
+    const envConnectionLimit = process.env.PRISMA_CONNECTION_LIMIT;
+    if (envConnectionLimit && !url.searchParams.has("connection_limit")) {
+      url.searchParams.set("connection_limit", envConnectionLimit);
+    }
+
+    return url.toString();
+  } catch {
+    return rawUrl;
+  }
+}
+
+const prismaUrl = buildPrismaUrl(env.databaseUrl);
+const adapter = isSqliteMode()
+  ? new PrismaBetterSqlite3({ url: prismaUrl })
+  : new PrismaPg({
+      connectionString: prismaUrl,
+      max: Number(new URL(prismaUrl).searchParams.get("connection_limit") ?? 10),
+      connectionTimeoutMillis: 30_000,
+    });
+const prismaClient = new PrismaClient({ adapter });
+
+export const prisma = global.prisma ?? prismaClient;
+
+async function executeRawIgnoreDuplicate(sql: string): Promise<void> {
+  try {
+    await prisma.$executeRawUnsafe(sql);
+  } catch (error) {
+    const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+    if (message.includes("duplicate column name")) {
+      return;
+    }
+    throw error;
+  }
+}
+
+function isSqliteMode(): boolean {
+  const databaseUrl = env.databaseUrl.toLowerCase();
+  return databaseUrl.startsWith("file:") || databaseUrl.startsWith("sqlite:");
+}
+
+/**
+ * Default SQLite settings are journal_mode=DELETE and busy_timeout=0 — the
+ * poller, cron scripts, and concurrent API requests all hit the same file,
+ * so any overlap fails instantly instead of waiting a moment for the lock.
+ * That surfaced as recurring "Socket timeout" Prisma errors on ordinary
+ * upserts (issueAttachment, issueActivityEvent, etc.) with no real load.
+ * WAL lets readers proceed during a writer; busy_timeout gives a writer
+ * a few seconds to retry before giving up.
+ */
+async function configureSqlitePragmas(): Promise<void> {
+  if (!isSqliteMode()) return;
+  // PRAGMA journal_mode and busy_timeout both return the value they set,
+  // and Prisma's SQLite driver rejects $executeRawUnsafe for statements
+  // that return rows ("Execute returned results, which is not allowed in
+  // SQLite") — must go through $queryRawUnsafe instead.
+  await prisma.$queryRawUnsafe(`PRAGMA journal_mode=WAL;`);
+  await prisma.$queryRawUnsafe(`PRAGMA busy_timeout=5000;`);
+}
+
+async function ensureRuntimeTables(): Promise<void> {
+  if (!isSqliteMode()) {
+    return;
+  }
+
+  // Keep older local SQLite files compatible when new models are added.
+  await prisma.$executeRawUnsafe(`
+    CREATE TABLE IF NOT EXISTS "IssueGithubLink" (
+      "id" TEXT NOT NULL PRIMARY KEY,
+      "issueId" TEXT NOT NULL,
+      "userId" TEXT NOT NULL,
+      "repositoryFullName" TEXT NOT NULL,
+      "githubIssueNumber" INTEGER,
+      "githubPrNumber" INTEGER,
+      "url" TEXT NOT NULL,
+      "title" TEXT,
+      "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "updatedAt" DATETIME NOT NULL,
+      CONSTRAINT "IssueGithubLink_issueId_fkey" FOREIGN KEY ("issueId") REFERENCES "Issue" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
+      CONSTRAINT "IssueGithubLink_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+    );
+  `);
+  await prisma.$executeRawUnsafe(`
+    CREATE UNIQUE INDEX IF NOT EXISTS "IssueGithubLink_issueId_url_key"
+    ON "IssueGithubLink"("issueId", "url");
+  `);
+  await prisma.$executeRawUnsafe(`
+    CREATE INDEX IF NOT EXISTS "IssueGithubLink_issueId_createdAt_idx"
+    ON "IssueGithubLink"("issueId", "createdAt");
+  `);
+  await prisma.$executeRawUnsafe(`
+    CREATE INDEX IF NOT EXISTS "IssueGithubLink_userId_createdAt_idx"
+    ON "IssueGithubLink"("userId", "createdAt");
+  `);
+  await executeRawIgnoreDuplicate(`
+    ALTER TABLE "Issue" ADD COLUMN "lastActivityAt" DATETIME;
+  `);
+  await executeRawIgnoreDuplicate(`
+    ALTER TABLE "Issue" ADD COLUMN "lastActivityType" TEXT;
+  `);
+  await prisma.$executeRawUnsafe(`
+    CREATE INDEX IF NOT EXISTS "Issue_userId_lastActivityAt_idx"
+    ON "Issue"("userId", "lastActivityAt");
+  `);
+  await prisma.$executeRawUnsafe(`
+    UPDATE "Issue"
+    SET "lastActivityAt" = "updatedOnRemote",
+        "lastActivityType" = COALESCE("lastActivityType", 'issue_update')
+    WHERE "lastActivityAt" IS NULL;
+  `);
+  await prisma.$executeRawUnsafe(`
+    CREATE TABLE IF NOT EXISTS "IssueActivityEvent" (
+      "id" TEXT NOT NULL PRIMARY KEY,
+      "issueId" TEXT NOT NULL,
+      "eventType" TEXT NOT NULL,
+      "source" TEXT NOT NULL,
+      "sourceRemoteId" TEXT,
+      "eventAt" DATETIME NOT NULL,
+      "summary" TEXT,
+      "dedupeKey" TEXT NOT NULL,
+      "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT "IssueActivityEvent_issueId_fkey" FOREIGN KEY ("issueId") REFERENCES "Issue" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+    );
+  `);
+  await prisma.$executeRawUnsafe(`
+    CREATE UNIQUE INDEX IF NOT EXISTS "IssueActivityEvent_dedupeKey_key"
+    ON "IssueActivityEvent"("dedupeKey");
+  `);
+  await prisma.$executeRawUnsafe(`
+    CREATE INDEX IF NOT EXISTS "IssueActivityEvent_issueId_eventAt_idx"
+    ON "IssueActivityEvent"("issueId", "eventAt");
+  `);
+  await prisma.$executeRawUnsafe(`
+    CREATE INDEX IF NOT EXISTS "IssueActivityEvent_issueId_eventType_idx"
+    ON "IssueActivityEvent"("issueId", "eventType");
+  `);
+  await prisma.$executeRawUnsafe(`
+    CREATE TABLE IF NOT EXISTS "WebhookSubscription" (
+      "id" TEXT NOT NULL PRIMARY KEY,
+      "name" TEXT NOT NULL,
+      "url" TEXT NOT NULL,
+      "secret" TEXT NOT NULL DEFAULT '',
+      "events" TEXT NOT NULL DEFAULT '[]',
+      "active" BOOLEAN NOT NULL DEFAULT true,
+      "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "createdBy" TEXT NOT NULL,
+      "lastTriggeredAt" DATETIME,
+      "lastStatus" INTEGER,
+      "failureCount" INTEGER NOT NULL DEFAULT 0
+    );
+  `);
+  await prisma.$executeRawUnsafe(`
+    CREATE INDEX IF NOT EXISTS "WebhookSubscription_active_idx"
+    ON "WebhookSubscription"("active");
+  `);
+  await prisma.$executeRawUnsafe(`
+    CREATE TABLE IF NOT EXISTS "WebhookDelivery" (
+      "id" TEXT NOT NULL PRIMARY KEY,
+      "subscriptionId" TEXT NOT NULL,
+      "event" TEXT NOT NULL,
+      "payload" TEXT NOT NULL,
+      "responseStatus" INTEGER,
+      "responseBody" TEXT,
+      "error" TEXT,
+      "durationMs" INTEGER,
+      "attempt" INTEGER NOT NULL DEFAULT 1,
+      "status" TEXT NOT NULL DEFAULT 'complete',
+      "nextAttemptAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "claimedAt" DATETIME,
+      "deliveredAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT "WebhookDelivery_subscriptionId_fkey"
+        FOREIGN KEY ("subscriptionId") REFERENCES "WebhookSubscription" ("id")
+        ON DELETE CASCADE ON UPDATE CASCADE
+    );
+  `);
+  await prisma.$executeRawUnsafe(`
+    CREATE INDEX IF NOT EXISTS "WebhookDelivery_subscriptionId_idx"
+    ON "WebhookDelivery"("subscriptionId");
+  `);
+  await prisma.$executeRawUnsafe(`
+    CREATE INDEX IF NOT EXISTS "WebhookDelivery_deliveredAt_idx"
+    ON "WebhookDelivery"("deliveredAt");
+  `);
+  await executeRawIgnoreDuplicate(`ALTER TABLE "WebhookDelivery" ADD COLUMN "status" TEXT NOT NULL DEFAULT 'complete';`);
+  await executeRawIgnoreDuplicate(`ALTER TABLE "WebhookDelivery" ADD COLUMN "nextAttemptAt" DATETIME NOT NULL DEFAULT '1970-01-01T00:00:00.000Z';`);
+  await executeRawIgnoreDuplicate(`ALTER TABLE "WebhookDelivery" ADD COLUMN "claimedAt" DATETIME;`);
+  await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "WebhookDelivery_status_nextAttemptAt_idx" ON "WebhookDelivery"("status", "nextAttemptAt");`);
+
+  // TimeEntry correlation columns
+  await executeRawIgnoreDuplicate(`
+    ALTER TABLE "TimeEntry" ADD COLUMN "source" TEXT;
+  `);
+  await executeRawIgnoreDuplicate(`
+    ALTER TABLE "TimeEntry" ADD COLUMN "wakaTimeDate" TEXT;
+  `);
+  await prisma.$executeRawUnsafe(`
+    CREATE UNIQUE INDEX IF NOT EXISTS "TimeEntry_issueId_wakaTimeDate_key"
+    ON "TimeEntry"("issueId", "wakaTimeDate");
+  `);
+}
+
+const isProductionBuild =
+  process.env.NEXT_PHASE === "phase-production-build" || process.env.npm_lifecycle_event === "build";
+
+if (!isProductionBuild) {
+  void configureSqlitePragmas()
+    .then(() => ensureRuntimeTables())
+    .catch((error) => {
+      trackFailure({ event: "db.runtime_tables.failed", error, metricName: "db_runtime_tables_failed" });
+    });
+}
+
+if (process.env.NODE_ENV !== "production") {
+  global.prisma = prisma;
+}

@@ -1,0 +1,352 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { NextRequest } from "next/server";
+
+const mockEnv: {
+  slackBotToken: string | undefined;
+  slackNotifyChannelId: string | undefined;
+  slackDefaultChannelId: string | undefined;
+  slackNotifyOnCreate: boolean;
+  slackNotifyOnUpdate: boolean;
+  slackNotifyOnStatusChange: boolean;
+  slackNotifyOnAssignment: boolean;
+  slackRefreshIntervalMs: number;
+  redmineBaseUrl: string;
+} = {
+  slackBotToken: "xoxb-test-token",
+  slackNotifyChannelId: "C123456",
+  slackDefaultChannelId: "C789012",
+  slackNotifyOnCreate: true,
+  slackNotifyOnUpdate: true,
+  slackNotifyOnStatusChange: true,
+  slackNotifyOnAssignment: true,
+  slackRefreshIntervalMs: 30000,
+  redmineBaseUrl: "https://redmine.example.com",
+};
+
+const mockSlackNotificationService = {
+  testNotification: vi.fn().mockResolvedValue({ success: true, message: "Test sent" }),
+  notifyIssueChanges: vi.fn().mockResolvedValue({ success: true }),
+};
+
+const mockNotifierTestNotification = vi.fn().mockResolvedValue(undefined);
+
+const MockSlackNotifier = class {
+  static createDefaultConfig = vi.fn().mockReturnValue({ channelId: "C123456" });
+  testNotification = mockNotifierTestNotification;
+};
+
+class MockSlackClient {
+  getThreadReplies = vi.fn().mockResolvedValue([
+    { user: "U123", text: "Hello", ts: "1234567890.123" },
+    { user: "U456", text: "World", ts: "1234567890.456" },
+  ]);
+  getUsers = vi.fn().mockResolvedValue(
+    new Map([
+      ["U123", "Alice"],
+      ["U456", "Bob"],
+    ])
+  );
+}
+
+const mockGetAuthenticatedUserId = vi.fn();
+const mockRequireExternalApiKey = vi.fn();
+
+vi.mock("@/src/lib/auth", () => ({
+  getAuthenticatedUserId: mockGetAuthenticatedUserId,
+}));
+
+vi.mock("@/src/lib/external-auth", () => ({
+  requireExternalApiKey: mockRequireExternalApiKey,
+}));
+
+vi.mock("@/src/lib/env", () => ({
+  env: mockEnv,
+}));
+
+vi.mock("@/src/lib/slack-notification-service", () => ({
+  getSlackNotificationService: () => mockSlackNotificationService,
+}));
+
+vi.mock("@/src/lib/slack-notifier", () => ({
+  SlackNotifier: MockSlackNotifier,
+}));
+
+vi.mock("@/src/lib/slack", () => ({
+  SlackClient: MockSlackClient,
+}));
+
+vi.mock("@/src/lib/log", () => ({
+  logEvent: vi.fn(),
+}));
+
+describe("Slack test route", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetAuthenticatedUserId.mockResolvedValue("user_1");
+    mockRequireExternalApiKey.mockReturnValue(null);
+  });
+
+  describe("POST /api/slack/test", () => {
+    it("returns 401 when unauthenticated", async () => {
+      mockGetAuthenticatedUserId.mockResolvedValue(null);
+      const { POST } = await import("@/app/api/slack/test/route");
+      const response = await POST();
+      expect(response.status).toBe(401);
+    });
+
+    it("returns 500 when slack bot token not configured", async () => {
+      mockEnv.slackBotToken = undefined;
+
+      const { POST } = await import("@/app/api/slack/test/route");
+      const response = await POST();
+      expect(response.status).toBe(500);
+      const body = await response.json();
+      expect(body.error).toContain("Slack bot token not configured");
+    });
+
+    it("returns 400 when no slack channel configured", async () => {
+      mockEnv.slackBotToken = "xoxb-test-token";
+      mockEnv.slackNotifyChannelId = undefined;
+      mockEnv.slackDefaultChannelId = undefined;
+
+      const { POST } = await import("@/app/api/slack/test/route");
+      const response = await POST();
+      expect(response.status).toBe(400);
+      const body = await response.json();
+      expect(body.error).toContain("No Slack channel configured");
+    });
+
+    it("sends test notification successfully", async () => {
+      mockEnv.slackBotToken = "xoxb-test-token";
+      mockEnv.slackNotifyChannelId = "C123456";
+      mockEnv.slackDefaultChannelId = "C789012";
+
+      const { POST } = await import("@/app/api/slack/test/route");
+      const response = await POST();
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body.success).toBe(true);
+    });
+
+    it("returns Slack's own error when the test post fails", async () => {
+      mockEnv.slackBotToken = "xoxb-test-token";
+      mockEnv.slackNotifyChannelId = "C123456";
+      mockNotifierTestNotification.mockRejectedValueOnce(new Error("An API error occurred: not_in_channel"));
+
+      const { POST } = await import("@/app/api/slack/test/route");
+      const response = await POST();
+      expect(response.status).toBe(500);
+      const body = await response.json();
+      expect(body.error).toContain("not_in_channel");
+    });
+  });
+});
+
+describe("Slack thread route", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetAuthenticatedUserId.mockResolvedValue("user_1");
+    mockRequireExternalApiKey.mockReturnValue(null);
+  });
+
+  describe("GET /api/slack/thread", () => {
+    const createNextRequest = (url: string): NextRequest => {
+      const req = new Request(url) as unknown as { nextUrl: URL };
+      req.nextUrl = new URL(url);
+      return req as unknown as NextRequest;
+    };
+
+    it("returns 401 when unauthenticated", async () => {
+      mockGetAuthenticatedUserId.mockResolvedValue(null);
+      const { GET } = await import("@/app/api/slack/thread/route");
+      const request = createNextRequest("http://localhost/api/slack/thread?channelId=C123&threadTs=1");
+      const response = await GET(request);
+      expect(response.status).toBe(401);
+    });
+
+    it("returns 500 when slack bot token not configured", async () => {
+      mockEnv.slackBotToken = undefined;
+
+      const { GET } = await import("@/app/api/slack/thread/route");
+      const request = createNextRequest("http://localhost/api/slack/thread?channelId=C123&threadTs=123");
+      const response = await GET(request);
+      expect(response.status).toBe(500);
+    });
+
+    it("returns 400 when channel ID not provided", async () => {
+      mockEnv.slackBotToken = "xoxb-test-token";
+
+      const { GET } = await import("@/app/api/slack/thread/route");
+      const request = createNextRequest("http://localhost/api/slack/thread?threadTs=123");
+      const response = await GET(request);
+      expect(response.status).toBe(400);
+    });
+
+    it("returns 400 when thread timestamp not provided", async () => {
+      mockEnv.slackBotToken = "xoxb-test-token";
+
+      const { GET } = await import("@/app/api/slack/thread/route");
+      const request = createNextRequest("http://localhost/api/slack/thread?channelId=C123");
+      const response = await GET(request);
+      expect(response.status).toBe(400);
+    });
+
+    it("returns thread messages successfully", async () => {
+      mockEnv.slackBotToken = "xoxb-test-token";
+
+      const { GET } = await import("@/app/api/slack/thread/route");
+      const request = createNextRequest("http://localhost/api/slack/thread?channelId=C123&threadTs=1234567890.123");
+      const response = await GET(request);
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body.messages).toHaveLength(2);
+      expect(body.users).toEqual({
+        U123: "Alice",
+        U456: "Bob",
+      });
+    });
+  });
+});
+
+describe("Slack notify route", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetAuthenticatedUserId.mockResolvedValue("user_1");
+    mockRequireExternalApiKey.mockReturnValue(null);
+    mockSlackNotificationService.notifyIssueChanges = vi.fn().mockResolvedValue({ success: true });
+  });
+
+  describe("POST /api/slack/notify", () => {
+    it("returns 401 when the external API key is missing/invalid", async () => {
+      mockRequireExternalApiKey.mockReturnValue(
+        new Response(JSON.stringify({ error: "Valid API key required" }), { status: 401 }),
+      );
+      const { POST } = await import("@/app/api/slack/notify/route");
+      const request = new Request("http://localhost/api/slack/notify", {
+        method: "POST",
+        body: JSON.stringify({ action: "test", issue: {} }),
+      });
+      const response = await POST(request as unknown as NextRequest);
+      expect(response.status).toBe(401);
+    });
+
+    it("returns 400 when payload is invalid", async () => {
+      const { POST } = await import("@/app/api/slack/notify/route");
+      const request = new Request("http://localhost/api/slack/notify", {
+        method: "POST",
+        body: JSON.stringify({ invalid: "payload" }),
+      });
+      const response = await POST(request as unknown as NextRequest);
+      expect(response.status).toBe(400);
+    });
+
+    it("handles test action", async () => {
+      mockSlackNotificationService.testNotification.mockResolvedValue({
+        success: true,
+        message: "Test sent",
+      });
+
+      const { POST } = await import("@/app/api/slack/notify/route");
+      const request = new Request("http://localhost/api/slack/notify", {
+        method: "POST",
+        body: JSON.stringify({
+          action: "test",
+          issue: {
+            id: "1",
+            redmineIssueId: 123,
+            subject: "Test Issue",
+            projectName: "Test",
+            statusName: "New",
+            priorityName: "Normal",
+            assignedToName: "John",
+            updatedAt: new Date().toISOString(),
+          },
+        }),
+      });
+      const response = await POST(request as unknown as NextRequest);
+      expect(response.status).toBe(200);
+    });
+
+    it("handles create action", async () => {
+      mockSlackNotificationService.notifyIssueChanges.mockResolvedValue({
+        success: true,
+      });
+
+      const { POST } = await import("@/app/api/slack/notify/route");
+      const request = new Request("http://localhost/api/slack/notify", {
+        method: "POST",
+        body: JSON.stringify({
+          action: "create",
+          issue: {
+            id: "1",
+            redmineIssueId: 123,
+            subject: "New Issue",
+            projectName: "Test",
+            statusName: "New",
+            priorityName: "High",
+            assignedToName: "John",
+            updatedAt: new Date().toISOString(),
+          },
+        }),
+      });
+      const response = await POST(request as unknown as NextRequest);
+      expect(response.status).toBe(200);
+    });
+
+    it("handles update action with changes", async () => {
+      mockSlackNotificationService.notifyIssueChanges.mockResolvedValue({
+        success: true,
+      });
+
+      const { POST } = await import("@/app/api/slack/notify/route");
+      const request = new Request("http://localhost/api/slack/notify", {
+        method: "POST",
+        body: JSON.stringify({
+          action: "update",
+          issue: {
+            id: "1",
+            redmineIssueId: 123,
+            subject: "Updated Issue",
+            projectName: "Test",
+            statusName: "In Progress",
+            priorityName: "High",
+            assignedToName: "John",
+            updatedAt: new Date().toISOString(),
+          },
+          changes: [
+            { field: "status", oldValue: "New", newValue: "In Progress" },
+            { field: "priority", oldValue: "Normal", newValue: "High" },
+          ],
+        }),
+      });
+      const response = await POST(request as unknown as NextRequest);
+      expect(response.status).toBe(200);
+    });
+
+    it("sends a close action as a close, not as a new issue", async () => {
+      const { POST } = await import("@/app/api/slack/notify/route");
+      const request = new Request("http://localhost/api/slack/notify", {
+        method: "POST",
+        body: JSON.stringify({
+          action: "close",
+          issue: {
+            id: "1",
+            redmineIssueId: 123,
+            subject: "Closed Issue",
+            projectName: "Test",
+            statusName: "Closed",
+            priorityName: "High",
+            assignedToName: "John",
+            updatedAt: new Date().toISOString(),
+          },
+        }),
+      });
+      const response = await POST(request as unknown as NextRequest);
+      expect(response.status).toBe(200);
+      expect(mockSlackNotificationService.notifyIssueChanges).toHaveBeenCalledWith(
+        expect.objectContaining({ isClosed: false }),
+        expect.objectContaining({ statusName: "Closed", isClosed: true }),
+      );
+    });
+  });
+});

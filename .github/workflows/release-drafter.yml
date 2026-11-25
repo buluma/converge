@@ -1,0 +1,43 @@
+name: Release drafter
+
+# Maintains an always-updated draft of the next release in the GitHub
+# Releases tab. Pull-request events apply Conventional-Commit labels; the
+# post-merge push to master updates the draft. Pushing its matching `v*` tag
+# publishes that draft.
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+    types: [opened, reopened, synchronize, edited]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  draft:
+    if: github.event_name != 'push' || github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    steps:
+      # v7 split the autolabeler into its own action; the drafter ignores the
+      # `autolabeler:` config on its own.
+      - uses: release-drafter/release-drafter/autolabeler@v7
+        if: github.event_name == 'pull_request'
+      - uses: release-drafter/release-drafter@v7
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the matching release draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # No checkout in this job, so gh cannot infer the repo from .git.
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: gh release edit "$TAG" --draft=false

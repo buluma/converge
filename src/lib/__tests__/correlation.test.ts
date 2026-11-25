@@ -1,0 +1,1027 @@
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+
+const {
+  mockIssueFindMany,
+  mockIssueFindFirst,
+  mockIssueUpdate,
+  mockIssueAggregate,
+  mockIssueCreate,
+  mockIssueFindUnique,
+  mockWakaFindMany,
+  mockTimeEntryFindMany,
+  mockTimeEntryCreate,
+  mockTimeEntryUpdate,
+  mockTimeEntryUpdateMany,
+  mockUserFindUnique,
+  mockGithubLinkFindFirst,
+  mockGithubLinkCreate,
+  mockTransaction,
+} = vi.hoisted(() => ({
+  mockIssueFindMany: vi.fn(),
+  mockIssueFindFirst: vi.fn(),
+  mockIssueUpdate: vi.fn(),
+  mockIssueAggregate: vi.fn(),
+  mockIssueCreate: vi.fn(),
+  mockIssueFindUnique: vi.fn(),
+  mockWakaFindMany: vi.fn(),
+  mockTimeEntryFindMany: vi.fn(),
+  mockTimeEntryCreate: vi.fn(),
+  mockTimeEntryUpdate: vi.fn(),
+  mockTimeEntryUpdateMany: vi.fn(),
+  mockUserFindUnique: vi.fn(),
+  mockGithubLinkFindFirst: vi.fn(),
+  mockGithubLinkCreate: vi.fn(),
+  mockTransaction: vi.fn(),
+}));
+
+const prismaMock = vi.hoisted(() => ({
+  issue: {
+    findMany: mockIssueFindMany,
+    findFirst: mockIssueFindFirst,
+    update: mockIssueUpdate,
+    aggregate: mockIssueAggregate,
+    create: mockIssueCreate,
+    findUnique: mockIssueFindUnique,
+  },
+  wakaTimeDailySummary: { findMany: mockWakaFindMany },
+  timeEntry: {
+    findMany: mockTimeEntryFindMany,
+    create: mockTimeEntryCreate,
+    update: mockTimeEntryUpdate,
+    updateMany: mockTimeEntryUpdateMany,
+  },
+  user: { findUnique: mockUserFindUnique },
+  issueGithubLink: { findFirst: mockGithubLinkFindFirst, create: mockGithubLinkCreate },
+  // applyTimeEntries batches the TimeEntry insert + spentHours increment in a
+  // $transaction([...]); default behaviour just resolves the built ops so the
+  // underlying create/update mocks still record their calls. The hours-
+  // correction path instead uses the interactive $transaction(async (tx) =>
+  // ...) form so it can bail out on a stale read — the default here calls
+  // straight through to the same mocked model methods via `tx`.
+  $transaction: mockTransaction,
+}));
+
+vi.mock("@/src/lib/db", () => ({
+  prisma: prismaMock,
+}));
+
+vi.mock("@/src/lib/activity-index", () => ({
+  recordIssueActivityEvent: vi.fn(),
+  recomputeIssueActivityIndex: vi.fn(),
+}));
+
+import {
+  normalizeProjectName,
+  buildProjectTicketIndex,
+  correlateWakaTime,
+  applyTimeEntries,
+  autoCreateTicketsForUnmatched,
+  getAutoCreateOptionsFromEnv,
+} from "@/src/lib/correlation";
+
+const USER_ID = "user-1";
+
+// Helper to build a minimal local issue with a github link
+function localIssue(id: string, localNum: number, subject: string, repos: string[]) {
+  return {
+    id,
+    localIssueNumber: localNum,
+    subject,
+    source: "local",
+    projectName: subject,
+    githubLinks: repos.map((r) => ({
+      id: `link-${r}`,
+      repositoryFullName: r,
+      url: `https://github.com/${r}`,
+    })),
+    spentHours: 0,
+  };
+}
+
+// Helper for a WakaTime daily row
+function wakaRow(date: string, projects: Array<{ name: string; total_seconds: number }>) {
+  return {
+    id: `waka-${date}`,
+    userId: USER_ID,
+    date,
+    totalSeconds: projects.reduce((s, p) => s + p.total_seconds, 0),
+    projectsJson: projects.map((p) => ({
+      name: p.name,
+      total_seconds: p.total_seconds,
+      percent: 100,
+      text: "",
+    })),
+  };
+}
+
+describe("normalizeProjectName", () => {
+  it("lowercases and strips non-alphanumerics", () => {
+    expect(normalizeProjectName("SL2-Platform")).toBe("sl2platform");
+    expect(normalizeProjectName("my_repo")).toBe("myrepo");
+  });
+
+  it("extracts repo segment from owner/repo format", () => {
+    expect(normalizeProjectName("buluma/SL2")).toBe("sl2");
+  });
+
+  it("handles empty/null", () => {
+    expect(normalizeProjectName("")).toBe("");
+    expect(normalizeProjectName(null as unknown as string)).toBe("");
+  });
+});
+
+describe("buildProjectTicketIndex", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("indexes tickets by normalized repo name", async () => {
+    mockIssueFindMany.mockResolvedValue([
+      localIssue("t1", 1, "SL2", ["buluma/SL2"]),
+      localIssue("t2", 2, "Acme", ["acme/acme-sa"]),
+    ]);
+
+    const index = await buildProjectTicketIndex(USER_ID);
+
+    expect(index.has("sl2")).toBe(true);
+    expect(index.get("sl2")!.ticket.id).toBe("t1");
+    expect(index.has("acmesa")).toBe(true);
+  });
+
+  it("skips issues with no github links", async () => {
+    mockIssueFindMany.mockResolvedValue([
+      { ...localIssue("t1", 1, "NoLink", []), githubLinks: [] },
+    ]);
+
+    const index = await buildProjectTicketIndex(USER_ID);
+    expect(index.size).toBe(0);
+  });
+});
+
+describe("correlateWakaTime", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("matches WakaTime project to ticket via github link", async () => {
+    mockIssueFindMany.mockResolvedValue([
+      localIssue("t1", 1, "SL2", ["buluma/SL2"]),
+    ]);
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-06-20", [{ name: "SL2", total_seconds: 3600 }]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([]);
+
+    const result = await correlateWakaTime(USER_ID, { start: "2026-06-20", end: "2026-06-20" });
+
+    expect(result.matched).toHaveLength(1);
+    expect(result.matched[0].ticketId).toBe("t1");
+    expect(result.matched[0].totalSeconds).toBe(3600);
+    expect(result.matched[0].perDay).toEqual([{ date: "2026-06-20", seconds: 3600 }]);
+    expect(result.unmatched).toHaveLength(0);
+  });
+
+  it("matches a WakaTime project whose name contains the repo name (worktree/branch variants)", async () => {
+    mockIssueFindMany.mockResolvedValue([
+      localIssue("t1", 1, "Converge", ["buluma/redmine-dashboard"]),
+    ]);
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-06-20", [{ name: "redmine-dashboard-ui-polish", total_seconds: 7200 }]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([]);
+
+    const result = await correlateWakaTime(USER_ID, { start: "2026-06-20", end: "2026-06-20" });
+
+    expect(result.matched).toHaveLength(1);
+    expect(result.matched[0].ticketId).toBe("t1");
+  });
+
+  it("does not match a generic WakaTime name that only appears inside a more specific repo name", async () => {
+    // "ansible-roles" (a whole collection) used to land on the one role
+    // ticket whose repo name happened to contain it.
+    mockIssueFindMany.mockResolvedValue([
+      localIssue("t1", 1, "ansible-role-sonarqube", ["buluma/ansible-role-sonarqube"]),
+    ]);
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-06-20", [{ name: "ansible-roles", total_seconds: 7200 }]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([]);
+
+    const result = await correlateWakaTime(USER_ID, { start: "2026-06-20", end: "2026-06-20" });
+
+    expect(result.matched).toHaveLength(0);
+    expect(result.unmatched.map((u) => u.project)).toEqual(["ansible-roles"]);
+  });
+
+  it("leaves a project unmatched when two repos tie as the most specific match", async () => {
+    // Used to break the tie alphabetically, i.e. pick one arbitrarily.
+    mockIssueFindMany.mockResolvedValue([
+      localIssue("t1", 1, "Alpha", ["buluma/alpha-tools"]),
+      localIssue("t2", 2, "Bravo", ["buluma/bravo-tools"]),
+    ]);
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-06-20", [{ name: "alpha-tools-bravo-tools", total_seconds: 3600 }]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([]);
+
+    const result = await correlateWakaTime(USER_ID, { start: "2026-06-20", end: "2026-06-20" });
+
+    expect(result.matched).toHaveLength(0);
+    expect(result.unmatched.map((u) => u.project)).toEqual(["alpha-tools-bravo-tools"]);
+  });
+
+  it("does not false-positive match a short substring collision", async () => {
+    // repo = "buluma/sl2platformx", waka project = "sl2" — "sl2" is too short
+    // (< MIN_SUBSTRING_MATCH_LENGTH) to trust as a real substring match, so
+    // it must NOT get swept into t1's hours.
+    mockIssueFindMany.mockResolvedValue([
+      localIssue("t1", 1, "SL2PlatformX", ["buluma/sl2platformx"]),
+    ]);
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-06-20", [{ name: "sl2", total_seconds: 3600 }]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([]);
+
+    const result = await correlateWakaTime(USER_ID, { start: "2026-06-20", end: "2026-06-20" });
+
+    expect(result.matched).toHaveLength(0);
+    expect(result.unmatched).toHaveLength(1);
+    expect(result.unmatched[0].project).toBe("sl2");
+  });
+
+  it("picks the most specific (longest) match deterministically when two repos could both substring-match", async () => {
+    mockIssueFindMany.mockResolvedValue([
+      localIssue("t1", 1, "Acme", ["acme/acme"]),
+      localIssue("t2", 2, "Acme Prod", ["acme/acme-prod"]),
+    ]);
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-06-20", [{ name: "acme-prod-optimization", total_seconds: 3600 }]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([]);
+
+    const result = await correlateWakaTime(USER_ID, { start: "2026-06-20", end: "2026-06-20" });
+
+    // "acmeprod" is a longer, more specific match than "acme" alone.
+    expect(result.matched).toHaveLength(1);
+    expect(result.matched[0].ticketId).toBe("t2");
+  });
+
+  it("puts unmatched projects in unmatched bucket", async () => {
+    mockIssueFindMany.mockResolvedValue([]);
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-06-20", [{ name: "random-project", total_seconds: 1800 }]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([]);
+
+    const result = await correlateWakaTime(USER_ID, { start: "2026-06-20", end: "2026-06-20" });
+
+    expect(result.matched).toHaveLength(0);
+    expect(result.unmatched).toHaveLength(1);
+    expect(result.unmatched[0].project).toBe("random-project");
+    expect(result.unmatched[0].totalSeconds).toBe(1800);
+  });
+
+  it("marks already-logged dates", async () => {
+    mockIssueFindMany.mockResolvedValue([
+      localIssue("t1", 1, "SL2", ["buluma/SL2"]),
+    ]);
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-06-19", [{ name: "SL2", total_seconds: 3600 }]),
+      wakaRow("2026-06-20", [{ name: "SL2", total_seconds: 7200 }]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([
+      { issueId: "t1", wakaTimeDate: "2026-06-19" },
+    ]);
+
+    const result = await correlateWakaTime(USER_ID, { start: "2026-06-19", end: "2026-06-20" });
+
+    expect(result.matched[0].alreadyLoggedDates).toContain("2026-06-19");
+    expect(result.matched[0].alreadyLoggedDates).not.toContain("2026-06-20");
+  });
+
+  it("aggregates multiple days for same project", async () => {
+    mockIssueFindMany.mockResolvedValue([
+      localIssue("t1", 1, "SL2", ["buluma/SL2"]),
+    ]);
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-06-19", [{ name: "SL2", total_seconds: 3600 }]),
+      wakaRow("2026-06-20", [{ name: "SL2", total_seconds: 7200 }]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([]);
+
+    const result = await correlateWakaTime(USER_ID, { start: "2026-06-19", end: "2026-06-20" });
+
+    expect(result.matched[0].totalSeconds).toBe(10800);
+    expect(result.matched[0].perDay).toHaveLength(2);
+  });
+
+  it("routes unmatched projects to the catch-all ticket when configured", async () => {
+    mockIssueFindMany.mockResolvedValue([]);
+    mockIssueFindFirst.mockResolvedValue({
+      id: "misc-1",
+      localIssueNumber: 999,
+      subject: "Misc / Unlinked",
+      projectName: "Misc",
+      spentHours: 0,
+    });
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-06-20", [{ name: "unknown", total_seconds: 1800 }]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([]);
+
+    const result = await correlateWakaTime(USER_ID, {
+      start: "2026-06-20",
+      end: "2026-06-20",
+      catchAllIssueId: "misc-1",
+    });
+
+    expect(result.unmatched).toHaveLength(0);
+    expect(result.matched).toHaveLength(1);
+    expect(result.matched[0].ticketId).toBe("misc-1");
+    expect(result.matched[0].repo).toBe("unknown"); // original project name preserved for traceability
+    expect(result.matched[0].totalSeconds).toBe(1800);
+  });
+
+  it("still prefers a real match over the catch-all when both are available", async () => {
+    mockIssueFindMany.mockResolvedValue([
+      localIssue("t1", 1, "SL2", ["buluma/SL2"]),
+    ]);
+    mockIssueFindFirst.mockResolvedValue({
+      id: "misc-1",
+      localIssueNumber: 999,
+      subject: "Misc / Unlinked",
+      projectName: "Misc",
+      spentHours: 0,
+    });
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-06-20", [{ name: "SL2", total_seconds: 3600 }]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([]);
+
+    const result = await correlateWakaTime(USER_ID, {
+      start: "2026-06-20",
+      end: "2026-06-20",
+      catchAllIssueId: "misc-1",
+    });
+
+    expect(result.matched).toHaveLength(1);
+    expect(result.matched[0].ticketId).toBe("t1"); // not swept into misc-1
+  });
+
+  it("falls back to unmatched when catchAllIssueId doesn't resolve to a real ticket", async () => {
+    mockIssueFindMany.mockResolvedValue([]);
+    mockIssueFindFirst.mockResolvedValue(null); // deleted ticket, wrong user, etc.
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-06-20", [{ name: "unknown", total_seconds: 1800 }]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([]);
+
+    const result = await correlateWakaTime(USER_ID, {
+      start: "2026-06-20",
+      end: "2026-06-20",
+      catchAllIssueId: "does-not-exist",
+    });
+
+    expect(result.matched).toHaveLength(0);
+    expect(result.unmatched).toHaveLength(1);
+  });
+
+  it("without catchAllIssueId, behaves exactly as before (no prisma.issue.findFirst call)", async () => {
+    mockIssueFindMany.mockResolvedValue([]);
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-06-20", [{ name: "unknown", total_seconds: 1800 }]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([]);
+
+    const result = await correlateWakaTime(USER_ID, { start: "2026-06-20", end: "2026-06-20" });
+
+    expect(result.unmatched).toHaveLength(1);
+    expect(mockIssueFindFirst).not.toHaveBeenCalled();
+  });
+
+  it("merges multiple distinct unmatched projects on the same day into one catch-all entry", async () => {
+    mockIssueFindMany.mockResolvedValue([]);
+    mockIssueFindFirst.mockResolvedValue({
+      id: "misc-1",
+      localIssueNumber: 999,
+      subject: "Misc / Unlinked",
+      projectName: "Misc",
+      spentHours: 0,
+    });
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-06-20", [
+        { name: "unknown", total_seconds: 1800 },
+        { name: ".pi", total_seconds: 900 },
+      ]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([]);
+
+    const result = await correlateWakaTime(USER_ID, {
+      start: "2026-06-20",
+      end: "2026-06-20",
+      catchAllIssueId: "misc-1",
+    });
+
+    // Same (issueId, date) constraint as any other ticket — one merged entry,
+    // not two, same simplification already accepted for multi-repo tickets.
+    expect(result.matched).toHaveLength(1);
+    expect(result.matched[0].ticketId).toBe("misc-1");
+    expect(result.matched[0].totalSeconds).toBe(2700);
+    // Both original project names stay traceable instead of only the first hit.
+    expect(result.matched[0].repo).toBe(".pi, unknown");
+  });
+
+  it("merges same-day activity when a ticket has multiple linked repos", async () => {
+    mockIssueFindMany.mockResolvedValue([
+      // ".openclaw" needs its own link: it only appears inside "openclaw-config",
+      // which is the direction findMatch doesn't substring-match.
+      localIssue("t1", 1, "Dashboard", ["buluma/redmine-dashboard", "buluma/.openclaw", "buluma/odysseus"]),
+    ]);
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-06-30", [
+        { name: "redmine-dashboard", total_seconds: 138 },
+        { name: ".openclaw", total_seconds: 141 },
+        { name: "odysseus", total_seconds: 288 },
+      ]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([]);
+
+    const result = await correlateWakaTime(USER_ID, { start: "2026-06-30", end: "2026-06-30" });
+
+    expect(result.matched).toHaveLength(1);
+    expect(result.matched[0].totalSeconds).toBe(567);
+    expect(result.matched[0].perDay).toEqual([{ date: "2026-06-30", seconds: 567 }]);
+  });
+});
+
+describe("applyTimeEntries", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockTransaction.mockImplementation((arg: Promise<unknown>[] | ((tx: typeof prismaMock) => unknown)) =>
+      typeof arg === "function" ? arg(prismaMock) : Promise.all(arg),
+    );
+    mockTimeEntryUpdateMany.mockResolvedValue({ count: 1 });
+  });
+
+  function setupCorrelation() {
+    mockIssueFindMany.mockResolvedValue([
+      localIssue("t1", 1, "SL2", ["buluma/SL2"]),
+    ]);
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-06-20", [{ name: "SL2", total_seconds: 7200 }]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([]);
+    mockTimeEntryCreate.mockResolvedValue({ id: "te-1" });
+    mockIssueUpdate.mockResolvedValue({});
+  }
+
+  it("creates time entry for matched unlogged day", async () => {
+    setupCorrelation();
+
+    const result = await applyTimeEntries(USER_ID, { start: "2026-06-20", end: "2026-06-20" });
+
+    expect(result.created).toBe(1);
+    expect(result.skipped).toBe(0);
+    expect(result.totalHours).toBeCloseTo(2.0);
+    expect(mockTimeEntryCreate).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        issueId: "t1",
+        userId: USER_ID,
+        hours: 2,
+        activityId: 31,
+        activityName: "Development",
+        source: "wakatime",
+        wakaTimeDate: "2026-06-20",
+      }),
+    });
+  });
+
+  it("skips already-logged dates", async () => {
+    mockIssueFindMany.mockResolvedValue([
+      localIssue("t1", 1, "SL2", ["buluma/SL2"]),
+    ]);
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-06-20", [{ name: "SL2", total_seconds: 7200 }]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([
+      { id: "te-1", issueId: "t1", wakaTimeDate: "2026-06-20", hours: 2, redmineTimeEntryId: 111 },
+    ]);
+
+    const result = await applyTimeEntries(USER_ID, { start: "2026-06-20", end: "2026-06-20" });
+
+    expect(result.created).toBe(0);
+    expect(result.updated).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(mockTimeEntryCreate).not.toHaveBeenCalled();
+  });
+
+  it("updates a local-only entry in place when the day's WakaTime total grew", async () => {
+    mockIssueFindMany.mockResolvedValue([localIssue("t1", 1, "SL2", ["buluma/SL2"])]);
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-06-20", [{ name: "SL2", total_seconds: 7200 }]), // 2h now
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([
+      { id: "te-1", issueId: "t1", wakaTimeDate: "2026-06-20", hours: 1, redmineTimeEntryId: null },
+    ]);
+    mockIssueUpdate.mockResolvedValue({});
+
+    const result = await applyTimeEntries(USER_ID, { start: "2026-06-20", end: "2026-06-20" });
+
+    expect(result.updated).toBe(1);
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(0);
+    expect(result.totalHours).toBeCloseTo(1); // the delta, not the new total
+    // Pinned to the previously-read hours value so a concurrent run that
+    // already applied this correction is detected (see the stale-read test
+    // below) instead of double-incrementing spentHours.
+    expect(mockTimeEntryUpdateMany).toHaveBeenCalledWith({
+      where: { id: "te-1", hours: 1 },
+      data: { hours: 2 },
+    });
+    expect(mockIssueUpdate).toHaveBeenCalledWith({
+      where: { id: "t1" },
+      data: expect.objectContaining({ spentHours: { increment: 1 } }),
+    });
+  });
+
+  it("skips a stale correction without double-incrementing spentHours when a concurrent run already applied it", async () => {
+    mockIssueFindMany.mockResolvedValue([localIssue("t1", 1, "SL2", ["buluma/SL2"])]);
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-06-20", [{ name: "SL2", total_seconds: 7200 }]), // 2h now
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([
+      { id: "te-1", issueId: "t1", wakaTimeDate: "2026-06-20", hours: 1, redmineTimeEntryId: null },
+    ]);
+    // A concurrent apply already corrected this row between our read and our
+    // write — updateMany's where clause (pinned to hours: 1) no longer
+    // matches, so it reports zero rows updated.
+    mockTimeEntryUpdateMany.mockResolvedValue({ count: 0 });
+
+    const result = await applyTimeEntries(USER_ID, { start: "2026-06-20", end: "2026-06-20" });
+
+    expect(result.updated).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(mockIssueUpdate).not.toHaveBeenCalled();
+  });
+
+  it("pushes an hours correction to Redmine for an already-pushed entry, given a client", async () => {
+    mockIssueFindMany.mockResolvedValue([localIssue("t1", 1, "SL2", ["buluma/SL2"])]);
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-06-20", [{ name: "SL2", total_seconds: 7200 }]), // 2h now
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([
+      { id: "te-1", issueId: "t1", wakaTimeDate: "2026-06-20", hours: 1, redmineTimeEntryId: 555 },
+    ]);
+    mockIssueUpdate.mockResolvedValue({});
+    const client = { updateTimeEntry: vi.fn().mockResolvedValue(undefined) };
+
+    const result = await applyTimeEntries(USER_ID, {
+      start: "2026-06-20",
+      end: "2026-06-20",
+      client: client as unknown as Parameters<typeof applyTimeEntries>[1]["client"],
+    });
+
+    expect(client.updateTimeEntry).toHaveBeenCalledWith(555, { hours: 2 });
+    expect(result.updated).toBe(1);
+    expect(mockTimeEntryUpdateMany).toHaveBeenCalledWith({
+      where: { id: "te-1", hours: 1 },
+      data: { hours: 2 },
+    });
+  });
+
+  it("records an update failure instead of writing locally when the Redmine push fails", async () => {
+    mockIssueFindMany.mockResolvedValue([localIssue("t1", 1, "SL2", ["buluma/SL2"])]);
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-06-20", [{ name: "SL2", total_seconds: 7200 }]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([
+      { id: "te-1", issueId: "t1", wakaTimeDate: "2026-06-20", hours: 1, redmineTimeEntryId: 555 },
+    ]);
+    const client = { updateTimeEntry: vi.fn().mockRejectedValue(new Error("403: issue is closed")) };
+
+    const result = await applyTimeEntries(USER_ID, {
+      start: "2026-06-20",
+      end: "2026-06-20",
+      client: client as unknown as Parameters<typeof applyTimeEntries>[1]["client"],
+    });
+
+    expect(result.updated).toBe(0);
+    expect(result.updateFailures).toHaveLength(1);
+    expect(result.updateFailures[0]).toMatchObject({ ticketId: "t1", date: "2026-06-20" });
+    expect(mockTimeEntryUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it("records an update failure when an already-pushed entry grew but no client was given", async () => {
+    mockIssueFindMany.mockResolvedValue([localIssue("t1", 1, "SL2", ["buluma/SL2"])]);
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-06-20", [{ name: "SL2", total_seconds: 7200 }]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([
+      { id: "te-1", issueId: "t1", wakaTimeDate: "2026-06-20", hours: 1, redmineTimeEntryId: 555 },
+    ]);
+
+    const result = await applyTimeEntries(USER_ID, { start: "2026-06-20", end: "2026-06-20" });
+
+    expect(result.updated).toBe(0);
+    expect(result.updateFailures).toHaveLength(1);
+    expect(mockTimeEntryUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it("dryRun returns summary without writing", async () => {
+    setupCorrelation();
+
+    const result = await applyTimeEntries(USER_ID, { start: "2026-06-20", end: "2026-06-20", dryRun: true });
+
+    expect(result.created).toBe(1);
+    expect(result.totalHours).toBeCloseTo(2.0);
+    expect(mockTimeEntryCreate).not.toHaveBeenCalled();
+    expect(mockIssueUpdate).not.toHaveBeenCalled();
+  });
+
+  it("creates one entry per day even when multiple linked repos match the same date", async () => {
+    mockIssueFindMany.mockResolvedValue([
+      localIssue("t1", 1, "Dashboard", ["buluma/redmine-dashboard", "buluma/odysseus"]),
+    ]);
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-06-30", [
+        { name: "redmine-dashboard", total_seconds: 138 },
+        { name: "odysseus", total_seconds: 288 },
+      ]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([]);
+    mockTimeEntryCreate.mockResolvedValue({ id: "te-1" });
+    mockIssueUpdate.mockResolvedValue({});
+
+    const result = await applyTimeEntries(USER_ID, { start: "2026-06-30", end: "2026-06-30" });
+
+    expect(mockTimeEntryCreate).toHaveBeenCalledTimes(1);
+    expect(result.created).toBe(1);
+    expect(result.entries[0].hours).toBeCloseTo(0.12);
+  });
+
+  it("updates issue lastActivityAt and spentHours after logging", async () => {
+    setupCorrelation();
+
+    await applyTimeEntries(USER_ID, { start: "2026-06-20", end: "2026-06-20" });
+
+    expect(mockIssueUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "t1" },
+        data: expect.objectContaining({
+          lastActivityType: "wakatime_time_logged",
+        }),
+      }),
+    );
+  });
+
+  it("treats a P2002 unique-violation (concurrent run logged the same date) as skipped, not an error", async () => {
+    setupCorrelation();
+    // A parallel apply/cron already wrote this issueId+wakaTimeDate between our
+    // correlate read and our write — the transaction rejects with P2002.
+    mockTransaction.mockRejectedValueOnce(Object.assign(new Error("Unique constraint failed"), { code: "P2002" }));
+
+    const result = await applyTimeEntries(USER_ID, { start: "2026-06-20", end: "2026-06-20" });
+
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(result.entries).toHaveLength(0);
+  });
+
+  it("still throws on a non-P2002 write failure", async () => {
+    setupCorrelation();
+    mockTransaction.mockRejectedValueOnce(Object.assign(new Error("connection reset"), { code: "P1001" }));
+
+    await expect(
+      applyTimeEntries(USER_ID, { start: "2026-06-20", end: "2026-06-20" }),
+    ).rejects.toThrow("connection reset");
+  });
+});
+
+describe("autoCreateTicketsForUnmatched", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  function unmatchedProject(project: string, totalSeconds: number) {
+    return { project, totalSeconds, perDay: [{ date: "2026-06-20", seconds: totalSeconds }] };
+  }
+
+  it("creates a ticket + github link for a project over threshold", async () => {
+    mockUserFindUnique.mockResolvedValue({ displayName: "Michael Buluma" });
+    mockGithubLinkFindFirst.mockResolvedValue(null);
+    mockIssueAggregate.mockResolvedValue({ _max: { localIssueNumber: 4 } });
+    mockIssueCreate.mockResolvedValue({ id: "new-issue-1" });
+    mockGithubLinkCreate.mockResolvedValue({ id: "link-1", url: "https://github.com/buluma/sweeper", createdAt: new Date() });
+
+    const created = await autoCreateTicketsForUnmatched(
+      USER_ID,
+      [unmatchedProject("sweeper", 7200)],
+      { thresholdSeconds: 7200, defaultOwner: "buluma" },
+    );
+
+    expect(created).toEqual([
+      { issueId: "new-issue-1", localIssueNumber: 5, project: "sweeper", repositoryFullName: "buluma/sweeper" },
+    ]);
+    expect(mockIssueCreate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          userId: USER_ID,
+          source: "local",
+          localIssueNumber: 5,
+          subject: "sweeper",
+          statusId: 1,
+          statusName: "New",
+          assignedToName: "Michael Buluma",
+        }),
+      }),
+    );
+    expect(mockGithubLinkCreate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          issueId: "new-issue-1",
+          repositoryFullName: "buluma/sweeper",
+          url: "https://github.com/buluma/sweeper",
+        }),
+      }),
+    );
+  });
+
+  it("skips projects below threshold", async () => {
+    const created = await autoCreateTicketsForUnmatched(
+      USER_ID,
+      [unmatchedProject("tiny-script", 60)],
+      { thresholdSeconds: 7200, defaultOwner: "buluma" },
+    );
+
+    expect(created).toEqual([]);
+    expect(mockIssueCreate).not.toHaveBeenCalled();
+  });
+
+  it("skips a project that already has a matching link (idempotent)", async () => {
+    mockGithubLinkFindFirst.mockResolvedValue({ id: "existing-link" });
+
+    const created = await autoCreateTicketsForUnmatched(
+      USER_ID,
+      [unmatchedProject("sweeper", 7200)],
+      { thresholdSeconds: 7200, defaultOwner: "buluma" },
+    );
+
+    expect(created).toEqual([]);
+    expect(mockIssueCreate).not.toHaveBeenCalled();
+  });
+
+  it("preserves an explicit owner/repo project name instead of prefixing defaultOwner", async () => {
+    mockUserFindUnique.mockResolvedValue({ displayName: "Michael Buluma" });
+    mockGithubLinkFindFirst.mockResolvedValue(null);
+    mockIssueAggregate.mockResolvedValue({ _max: { localIssueNumber: null } });
+    mockIssueCreate.mockResolvedValue({ id: "new-issue-2" });
+    mockGithubLinkCreate.mockResolvedValue({ id: "link-2", url: "https://github.com/other-owner/tool", createdAt: new Date() });
+
+    const created = await autoCreateTicketsForUnmatched(
+      USER_ID,
+      [unmatchedProject("other-owner/tool", 7200)],
+      { thresholdSeconds: 7200, defaultOwner: "buluma" },
+    );
+
+    expect(created[0].repositoryFullName).toBe("other-owner/tool");
+  });
+});
+
+describe("applyTimeEntries with autoCreate", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockTransaction.mockImplementation((arg: Promise<unknown>[] | ((tx: typeof prismaMock) => unknown)) =>
+      typeof arg === "function" ? arg(prismaMock) : Promise.all(arg),
+    );
+    mockTimeEntryUpdateMany.mockResolvedValue({ count: 1 });
+  });
+
+  it("auto-creates a ticket for unmatched activity, then logs it as matched in the same call", async () => {
+    // First correlateWakaTime pass (no catchAll) sees "sweeper" as unmatched.
+    // After auto-create inserts its github link, the index rebuild for the
+    // second pass must reflect the new ticket — simulate that by having
+    // issue.findMany return it only once a link has been "created".
+    let linkCreated = false;
+    mockIssueFindMany.mockImplementation(async () => {
+      if (!linkCreated) return [];
+      return [localIssue("new-issue-1", 5, "sweeper", ["buluma/sweeper"])];
+    });
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-06-20", [{ name: "sweeper", total_seconds: 7200 }]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([]);
+    mockUserFindUnique.mockResolvedValue({ displayName: "Michael Buluma" });
+    mockGithubLinkFindFirst.mockResolvedValue(null);
+    mockIssueAggregate.mockResolvedValue({ _max: { localIssueNumber: 4 } });
+    mockIssueCreate.mockResolvedValue({ id: "new-issue-1" });
+    mockGithubLinkCreate.mockImplementation(async () => {
+      linkCreated = true;
+      return { id: "link-1", url: "https://github.com/buluma/sweeper", createdAt: new Date() };
+    });
+    mockTimeEntryCreate.mockResolvedValue({ id: "te-1" });
+    mockIssueUpdate.mockResolvedValue({});
+
+    const result = await applyTimeEntries(USER_ID, {
+      start: "2026-06-20",
+      end: "2026-06-20",
+      autoCreate: { thresholdSeconds: 7200, defaultOwner: "buluma" },
+    });
+
+    expect(mockIssueCreate).toHaveBeenCalledTimes(1);
+    expect(result.autoCreatedTickets).toEqual([
+      { issueId: "new-issue-1", localIssueNumber: 5, project: "sweeper", repositoryFullName: "buluma/sweeper" },
+    ]);
+    expect(result.created).toBe(1);
+    expect(mockTimeEntryCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ issueId: "new-issue-1" }) }),
+    );
+  });
+
+  it("does not auto-create anything on dryRun", async () => {
+    mockIssueFindMany.mockResolvedValue([]);
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-06-20", [{ name: "sweeper", total_seconds: 7200 }]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([]);
+
+    const result = await applyTimeEntries(USER_ID, {
+      start: "2026-06-20",
+      end: "2026-06-20",
+      dryRun: true,
+      autoCreate: { thresholdSeconds: 7200, defaultOwner: "buluma" },
+    });
+
+    expect(mockIssueCreate).not.toHaveBeenCalled();
+    expect(result.autoCreatedTickets).toBeUndefined();
+  });
+});
+
+describe("getAutoCreateOptionsFromEnv", () => {
+  const originalEnv = { ...process.env };
+  afterEach(() => {
+    process.env = { ...originalEnv };
+  });
+
+  it("returns undefined when GITHUB_DEFAULT_OWNER is not set", () => {
+    delete process.env.GITHUB_DEFAULT_OWNER;
+    expect(getAutoCreateOptionsFromEnv()).toBeUndefined();
+  });
+
+  it("returns undefined when explicitly disabled", () => {
+    process.env.GITHUB_DEFAULT_OWNER = "buluma";
+    process.env.AUTO_CREATE_UNMATCHED_TICKETS = "false";
+    expect(getAutoCreateOptionsFromEnv()).toBeUndefined();
+  });
+
+  it("returns options with defaults when owner is set and not disabled", () => {
+    process.env.GITHUB_DEFAULT_OWNER = "buluma";
+    delete process.env.AUTO_CREATE_UNMATCHED_TICKETS;
+    delete process.env.AUTO_CREATE_TICKET_THRESHOLD_SECONDS;
+    expect(getAutoCreateOptionsFromEnv()).toEqual({ thresholdSeconds: 7200, defaultOwner: "buluma" });
+  });
+
+  it("respects a custom threshold", () => {
+    process.env.GITHUB_DEFAULT_OWNER = "buluma";
+    process.env.AUTO_CREATE_TICKET_THRESHOLD_SECONDS = "3600";
+    expect(getAutoCreateOptionsFromEnv()).toEqual({ thresholdSeconds: 3600, defaultOwner: "buluma" });
+  });
+});
+
+describe("project-day ownership across tickets", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockTransaction.mockImplementation((arg: Promise<unknown>[] | ((tx: typeof prismaMock) => unknown)) =>
+      typeof arg === "function" ? arg(prismaMock) : Promise.all(arg),
+    );
+    mockTimeEntryUpdateMany.mockResolvedValue({ count: 1 });
+    mockTimeEntryCreate.mockResolvedValue({ id: "te-new" });
+    mockIssueUpdate.mockResolvedValue({});
+  });
+
+  // Last week's recurring instance: its link has already moved to this
+  // week's instance, so it's no longer in the ticket index at all.
+  const lastWeek = { id: "w1", localIssueNumber: 93, subject: "Week 37 Acme Support", projectName: "Week 37", spentHours: 3 };
+
+  function loggedOn(
+    issue: typeof lastWeek,
+    overrides: { id?: string; date?: string; hours?: number; project?: string | null; createdAt?: string; redmineTimeEntryId?: number | null } = {},
+  ) {
+    return {
+      id: overrides.id ?? `te-${issue.id}`,
+      issueId: issue.id,
+      wakaTimeDate: overrides.date ?? "2026-09-12",
+      hours: overrides.hours ?? 3,
+      redmineTimeEntryId: overrides.redmineTimeEntryId ?? null,
+      wakaTimeProject: overrides.project === undefined ? "Acme-Prod-Optimization" : overrides.project,
+      createdAt: new Date(overrides.createdAt ?? "2026-09-12T18:00:00Z"),
+      issue,
+    };
+  }
+
+  function thisWeekHoldsTheLink() {
+    mockIssueFindMany.mockResolvedValue([
+      localIssue("w2", 99, "Week 38 Acme Support", ["Acme-Prod-Optimization"]),
+    ]);
+  }
+
+  it("keeps a project-day on the ticket it was first logged on after the link moves", async () => {
+    thisWeekHoldsTheLink();
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-09-12", [{ name: "Acme-Prod-Optimization", total_seconds: 3 * 3600 }]),
+      wakaRow("2026-09-14", [{ name: "Acme-Prod-Optimization", total_seconds: 3600 }]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([loggedOn(lastWeek)]);
+
+    const result = await correlateWakaTime(USER_ID, { start: "2026-09-12", end: "2026-09-14" });
+
+    const byTicket = Object.fromEntries(result.matched.map((m) => [m.ticketId, m]));
+    expect(byTicket.w1.perDay).toEqual([{ date: "2026-09-12", seconds: 3 * 3600 }]);
+    expect(byTicket.w1.alreadyLoggedDates).toEqual(["2026-09-12"]);
+    // Only the day nobody has logged yet goes to the ticket holding the link.
+    expect(byTicket.w2.perDay).toEqual([{ date: "2026-09-14", seconds: 3600 }]);
+  });
+
+  it("does not create a second entry for a project-day already logged on another ticket", async () => {
+    thisWeekHoldsTheLink();
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-09-12", [{ name: "Acme-Prod-Optimization", total_seconds: 3 * 3600 }]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([loggedOn(lastWeek)]);
+
+    const result = await applyTimeEntries(USER_ID, { start: "2026-09-12", end: "2026-09-12" });
+
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(mockTimeEntryCreate).not.toHaveBeenCalled();
+  });
+
+  it("corrects the owning ticket, not the one holding the link, when that day's total grows", async () => {
+    thisWeekHoldsTheLink();
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-09-12", [{ name: "Acme-Prod-Optimization", total_seconds: 4 * 3600 }]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([loggedOn(lastWeek, { id: "te-w1", hours: 3 })]);
+
+    const result = await applyTimeEntries(USER_ID, { start: "2026-09-12", end: "2026-09-12" });
+
+    expect(result.updated).toBe(1);
+    expect(mockTimeEntryUpdateMany).toHaveBeenCalledWith({ where: { id: "te-w1", hours: 3 }, data: { hours: 4 } });
+    expect(mockTimeEntryCreate).not.toHaveBeenCalled();
+  });
+
+  it("picks the earliest-logged ticket when a project-day is already duplicated", async () => {
+    thisWeekHoldsTheLink();
+    const later = { ...lastWeek, id: "w0", localIssueNumber: 2, subject: "Other ticket" };
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-09-12", [{ name: "Acme-Prod-Optimization", total_seconds: 3 * 3600 }]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([
+      loggedOn(later, { createdAt: "2026-09-13T06:00:00Z" }),
+      loggedOn(lastWeek, { createdAt: "2026-09-12T18:00:00Z" }),
+    ]);
+
+    const result = await correlateWakaTime(USER_ID, { start: "2026-09-12", end: "2026-09-12" });
+
+    expect(result.matched.map((m) => m.ticketId)).toEqual(["w1"]);
+  });
+
+  it("matches ownership on any project in a merged entry, normalized", async () => {
+    mockIssueFindMany.mockResolvedValue([localIssue("t2", 2, "SL2", ["buluma/SL2"])]);
+    mockWakaFindMany.mockResolvedValue([wakaRow("2026-09-12", [{ name: "SL2", total_seconds: 3600 }])]);
+    mockTimeEntryFindMany.mockResolvedValue([loggedOn(lastWeek, { project: ".pi, buluma/SL2" })]);
+
+    const result = await correlateWakaTime(USER_ID, { start: "2026-09-12", end: "2026-09-12" });
+
+    expect(result.matched.map((m) => m.ticketId)).toEqual(["w1"]);
+  });
+
+  it("ignores legacy entries with no wakaTimeProject for ownership", async () => {
+    thisWeekHoldsTheLink();
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-09-12", [{ name: "Acme-Prod-Optimization", total_seconds: 3600 }]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([loggedOn(lastWeek, { project: null })]);
+
+    const result = await correlateWakaTime(USER_ID, { start: "2026-09-12", end: "2026-09-12" });
+
+    expect(result.matched.map((m) => m.ticketId)).toEqual(["w2"]);
+  });
+
+  it("records the WakaTime project(s) for the day on new entries", async () => {
+    mockIssueFindMany.mockResolvedValue([
+      localIssue("t1", 1, "Dashboard", ["buluma/redmine-dashboard", "buluma/odysseus"]),
+    ]);
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-09-12", [
+        { name: "redmine-dashboard", total_seconds: 1800 },
+        { name: "odysseus", total_seconds: 1800 },
+      ]),
+      wakaRow("2026-09-13", [{ name: "odysseus", total_seconds: 3600 }]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([]);
+
+    await applyTimeEntries(USER_ID, { start: "2026-09-12", end: "2026-09-13" });
+
+    expect(mockTimeEntryCreate).toHaveBeenCalledWith({
+      data: expect.objectContaining({ wakaTimeDate: "2026-09-12", wakaTimeProject: "odysseus, redmine-dashboard" }),
+    });
+    // Per day, not every project the ticket saw across the whole window.
+    expect(mockTimeEntryCreate).toHaveBeenCalledWith({
+      data: expect.objectContaining({ wakaTimeDate: "2026-09-13", wakaTimeProject: "odysseus" }),
+    });
+  });
+});
