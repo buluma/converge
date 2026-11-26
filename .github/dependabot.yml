@@ -8,6 +8,16 @@ updates:
     commit-message:
       prefix: "chore"
       include: "scope"
+    # Packages that share internals must move together: a split @sentry/*
+    # version breaks typecheck (two @sentry/core copies), and prisma CLI,
+    # client and adapters, or vitest and @vitest/*, should not drift apart.
+    groups:
+      sentry:
+        patterns: ["@sentry/*"]
+      prisma:
+        patterns: ["prisma", "@prisma/*"]
+      vitest:
+        patterns: ["vitest", "@vitest/*"]
 
   # Dockerfile / Dockerfile.pi base images
   - package-ecosystem: "docker"
