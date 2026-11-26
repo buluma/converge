@@ -385,7 +385,7 @@ export async function fetchStreamlineLogsFromAPI(
     // is reached so a gap between polls (restart, outage) loses nothing.
     // Without one (first poll for this portal) take a single page.
     const afterId = options.afterIds?.[model.key];
-    const collected: Record<string, unknown>[] = [];
+    let collected: Record<string, unknown>[] = [];
     try {
       for (let page = 0; ; page++) {
         const url = `${apiBase}/api/v1/custom_objects/${apiName}/get_all?token=${token}&model_alias=${model.alias}&order_by=id&order=DESC&limit=${limit}&offset=${page * limit}`;
@@ -393,6 +393,7 @@ export async function fetchStreamlineLogsFromAPI(
 
         if (!res.ok) {
           result.errors.push(`HTTP ${res.status} from ${model.alias}`);
+          collected = [];
           break;
         }
 
@@ -400,6 +401,7 @@ export async function fetchStreamlineLogsFromAPI(
         // The API reports some failures (e.g. limit over 1000) as HTTP 200.
         if (data?.success === false) {
           result.errors.push(`${model.alias}: ${data?.error?.message || data?.message || 'request failed'}`);
+          collected = [];
           break;
         }
         const records = data?.data?.records || [];
@@ -431,7 +433,11 @@ export async function fetchStreamlineLogsFromAPI(
       }
     } catch (err) {
       result.errors.push(`Failed to fetch ${model.alias}: ${err instanceof Error ? err.message : String(err)}`);
+      collected = [];
     }
+    // collected is emptied on any failure: storing the pages before it would
+    // move the poller's resume id past the failed pages, so they would never
+    // be fetched. Returning nothing makes the next poll page back from the old id.
     result[model.key] = collected;
   }
 
