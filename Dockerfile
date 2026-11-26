@@ -26,11 +26,27 @@ RUN bunx prisma generate --schema=${PRISMA_SCHEMA}
 # Copy source code
 COPY . .
 
-# Build the application. next build loads .env itself, and Prisma 7 rejects a
-# DATABASE_URL whose driver does not match the generated client, so Postgres builds
-# get a placeholder Postgres URL here. The build never connects; the runtime URL
-# still comes from the container environment.
-RUN if [ "$PRISMA_SCHEMA" = "prisma/schema.prisma" ]; then \
+# NEXT_PUBLIC_* values are inlined into the bundles at build time, so they come
+# in as build args. One left unset stays undefined, not "", as it would be with
+# no .env at all.
+ARG NEXT_PUBLIC_APP_URL
+ARG NEXT_PUBLIC_SENTRY_DSN
+ARG NEXT_PUBLIC_SENTRY_ENABLE_LOGS
+ARG NEXT_PUBLIC_VAPID_PUBLIC_KEY
+
+# Build the application. .env files are not in the build context, so the
+# variables env.ts requires at import get throwaway values generated for this
+# step only; real values come from the container environment at runtime.
+# Prisma 7 rejects a DATABASE_URL whose driver does not match the generated
+# client, so Postgres builds get a placeholder Postgres URL. The build never
+# connects.
+RUN for v in NEXT_PUBLIC_APP_URL NEXT_PUBLIC_SENTRY_DSN NEXT_PUBLIC_SENTRY_ENABLE_LOGS NEXT_PUBLIC_VAPID_PUBLIC_KEY; do \
+      eval "[ -n \"\${$v}\" ] || unset $v"; \
+    done && \
+    export DATABASE_URL="file:./build.db" \
+      APP_ENCRYPTION_KEY="$(head -c 32 /dev/urandom | base64)" \
+      SESSION_SECRET="$(head -c 32 /dev/urandom | base64)" && \
+    if [ "$PRISMA_SCHEMA" = "prisma/schema.prisma" ]; then \
       export DATABASE_URL="postgresql://build:build@localhost:5432/build"; \
     fi && bun run build
 
