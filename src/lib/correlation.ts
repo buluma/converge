@@ -272,18 +272,30 @@ export async function correlateWakaTime(
   // Earliest entry wins where a project-day is already duplicated, so the
   // owner is stable across runs (and matches the cleanup's keep rule).
   const ownerByProjectDay = new Map<string, TicketMatch>();
+  // A WakaTime project name can itself contain ", ", so the stored list
+  // doesn't split back into the names it was built from. Every run of two or
+  // more consecutive parts is registered here too: joining keeps a name like
+  // "A, B" as a consecutive run, so it still finds its ticket. Only names
+  // containing ", " look here, because normalizing drops the separator and
+  // "foo, bar" would otherwise claim an unrelated "foo-bar".
+  const compoundOwnerByProjectDay = new Map<string, TicketMatch>();
   const byCreation = existingEntries
     .filter((e) => e.wakaTimeProject)
     .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id));
   for (const e of byCreation) {
     if (!e.wakaTimeProject) continue;
-    for (const name of e.wakaTimeProject.split(", ")) {
-      const key = `${normalizeProjectName(name)}:${e.wakaTimeDate}`;
-      if (ownerByProjectDay.has(key)) continue;
-      ownerByProjectDay.set(key, {
-        ticket: e.issue,
-        link: { id: "logged", repositoryFullName: name, url: "" },
-      });
+    const parts = e.wakaTimeProject.split(", ");
+    for (let i = 0; i < parts.length; i++) {
+      for (let j = i + 1; j <= parts.length; j++) {
+        const name = parts.slice(i, j).join(", ");
+        const owners = j - i === 1 ? ownerByProjectDay : compoundOwnerByProjectDay;
+        const key = `${normalizeProjectName(name)}:${e.wakaTimeDate}`;
+        if (owners.has(key)) continue;
+        owners.set(key, {
+          ticket: e.issue,
+          link: { id: "logged", repositoryFullName: name, url: "" },
+        });
+      }
     }
   }
 
@@ -315,8 +327,9 @@ export async function correlateWakaTime(
     for (const proj of projects) {
       if (proj.total_seconds <= 0) continue;
 
+      const owners = proj.name.includes(", ") ? compoundOwnerByProjectDay : ownerByProjectDay;
       const match: TicketMatch | null =
-        ownerByProjectDay.get(`${normalizeProjectName(proj.name)}:${row.date}`) ??
+        owners.get(`${normalizeProjectName(proj.name)}:${row.date}`) ??
         findMatch(proj.name, index) ??
         (catchAllTicket
           ? { ticket: catchAllTicket, link: { id: "catchall", repositoryFullName: proj.name, url: "" } }
@@ -556,6 +569,7 @@ export async function applyTimeEntries(
 
       const hours = Math.round((day.seconds / 3600) * 100) / 100;
       const existing = row.existingEntriesByDate[day.date];
+      const dayProjects = row.projectsByDate[day.date]?.join(", ");
 
       if (existing) {
         const delta = hours - existing.hours;
@@ -600,7 +614,9 @@ export async function applyTimeEntries(
             // correction that already landed.
             const result = await tx.timeEntry.updateMany({
               where: { id: existing.id, hours: existing.hours },
-              data: { hours },
+              // Refresh the project list too: names that joined the day
+              // since the first write must stay owned by this ticket.
+              data: { hours, wakaTimeProject: dayProjects },
             });
             if (result.count === 0) {
               staleRead = true;
@@ -662,7 +678,7 @@ export async function applyTimeEntries(
               comments: `WakaTime: ${row.repo.split("/").pop() ?? row.repo} ${day.date}`,
               source: "wakatime",
               wakaTimeDate: day.date,
-              wakaTimeProject: row.projectsByDate[day.date]?.join(", ") ?? null,
+              wakaTimeProject: dayProjects ?? null,
             },
           }),
           prisma.issue.update({
