@@ -277,6 +277,44 @@ describe("fetchStreamlineLogsFromAPI paging", () => {
     expect(result.capped).toEqual(["server_side_rules_log"]);
   });
 
+  // A later page failing must not hand back the earlier pages: storing them
+  // moves the newest-stored id past the failed pages, which are then never
+  // fetched. Dropping them makes the next poll page back from the old id.
+  it.each([
+    ["an HTTP error", () => new Response("bad gateway", { status: 502 }), "HTTP 502 from server_side_rules_log"],
+    [
+      "a 200 response with success: false",
+      () => new Response(JSON.stringify({ success: false, message: "Failed to retrieve records" }), { status: 200 }),
+      "server_side_rules_log: Failed to retrieve records",
+    ],
+    [
+      "a network error",
+      () => {
+        throw new Error("socket hang up");
+      },
+      "Failed to fetch server_side_rules_log: socket hang up",
+    ],
+  ])("returns nothing for a model when a later page fails with %s", async (_, failure, error) => {
+    const paged = stubPagedApi({ server_side_rules_log: range(1, 25), mbu_logs: range(1, 3) });
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      const q = new URL(url).searchParams;
+      if (q.get("model_alias") === "server_side_rules_log" && q.get("offset") === "5") return failure();
+      return paged(url);
+    }));
+
+    const result = await fetchStreamlineLogsFromAPI({
+      host: "h.example.com",
+      token: "t",
+      limit: 5,
+      afterIds: { serverSideRules: BigInt(12), mbuLogs: BigInt(0) },
+    });
+
+    expect(result.serverSideRules).toEqual([]);
+    expect(result.errors).toEqual([error]);
+    // Other models are unaffected.
+    expect(ids(result.mbuLogs)).toEqual([3, 2, 1]);
+  });
+
   it("treats a 200 response with success: false as an error", async () => {
     vi.stubGlobal("fetch", vi.fn(async () =>
       new Response(
