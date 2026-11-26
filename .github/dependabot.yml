@@ -18,6 +18,13 @@ updates:
         patterns: ["prisma", "@prisma/*"]
       vitest:
         patterns: ["vitest", "@vitest/*"]
+    ignore:
+      # From 11.13 @sentry/nextjs resolves a "bun" export (index.bun.js) when
+      # it runs under Bun, which the Docker image does. Next's standalone
+      # tracing only copies the Node entry, so the server can't load Sentry
+      # at runtime. Hold at 11.12 until that is solved.
+      - dependency-name: "@sentry/*"
+        versions: [">= 11.13.0"]
 
   # Dockerfile / Dockerfile.pi base images
   - package-ecosystem: "docker"
