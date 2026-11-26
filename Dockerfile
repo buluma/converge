@@ -35,16 +35,17 @@ ARG NEXT_PUBLIC_SENTRY_ENABLE_LOGS
 ARG NEXT_PUBLIC_VAPID_PUBLIC_KEY
 
 # Build the application. .env files are not in the build context, so the
-# variables env.ts requires at import get build-only placeholders; real values
-# come from the container environment at runtime. Prisma 7 rejects a
-# DATABASE_URL whose driver does not match the generated client, so Postgres
-# builds get a placeholder Postgres URL. The build never connects.
+# variables env.ts requires at import get throwaway values generated for this
+# step only; real values come from the container environment at runtime.
+# Prisma 7 rejects a DATABASE_URL whose driver does not match the generated
+# client, so Postgres builds get a placeholder Postgres URL. The build never
+# connects.
 RUN for v in NEXT_PUBLIC_APP_URL NEXT_PUBLIC_SENTRY_DSN NEXT_PUBLIC_SENTRY_ENABLE_LOGS NEXT_PUBLIC_VAPID_PUBLIC_KEY; do \
       eval "[ -n \"\${$v}\" ] || unset $v"; \
     done && \
     export DATABASE_URL="file:./build.db" \
-      APP_ENCRYPTION_KEY="YnVpbGQtb25seS1wbGFjZWhvbGRlci0zMi1ieXRlcyE=" \
-      SESSION_SECRET="build-only-placeholder" && \
+      APP_ENCRYPTION_KEY="$(head -c 32 /dev/urandom | base64)" \
+      SESSION_SECRET="$(head -c 32 /dev/urandom | base64)" && \
     if [ "$PRISMA_SCHEMA" = "prisma/schema.prisma" ]; then \
       export DATABASE_URL="postgresql://build:build@localhost:5432/build"; \
     fi && bun run build
