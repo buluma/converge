@@ -532,7 +532,7 @@ describe("applyTimeEntries", () => {
     // below) instead of double-incrementing spentHours.
     expect(mockTimeEntryUpdateMany).toHaveBeenCalledWith({
       where: { id: "te-1", hours: 1 },
-      data: { hours: 2 },
+      data: { hours: 2, wakaTimeProject: "SL2" },
     });
     expect(mockIssueUpdate).toHaveBeenCalledWith({
       where: { id: "t1" },
@@ -581,7 +581,7 @@ describe("applyTimeEntries", () => {
     expect(result.updated).toBe(1);
     expect(mockTimeEntryUpdateMany).toHaveBeenCalledWith({
       where: { id: "te-1", hours: 1 },
-      data: { hours: 2 },
+      data: { hours: 2, wakaTimeProject: "SL2" },
     });
   });
 
@@ -959,7 +959,7 @@ describe("project-day ownership across tickets", () => {
     const result = await applyTimeEntries(USER_ID, { start: "2026-09-12", end: "2026-09-12" });
 
     expect(result.updated).toBe(1);
-    expect(mockTimeEntryUpdateMany).toHaveBeenCalledWith({ where: { id: "te-w1", hours: 3 }, data: { hours: 4 } });
+    expect(mockTimeEntryUpdateMany).toHaveBeenCalledWith({ where: { id: "te-w1", hours: 3 }, data: { hours: 4, wakaTimeProject: "Acme-Prod-Optimization" } });
     expect(mockTimeEntryCreate).not.toHaveBeenCalled();
   });
 
@@ -987,6 +987,68 @@ describe("project-day ownership across tickets", () => {
     const result = await correlateWakaTime(USER_ID, { start: "2026-09-12", end: "2026-09-12" });
 
     expect(result.matched.map((m) => m.ticketId)).toEqual(["w1"]);
+  });
+
+  it("keeps a project-day on its ticket when a WakaTime project name itself contains \", \"", async () => {
+    // WakaTime can report a project named "Beta, Acme-Prod-Optimization".
+    // wakaTimeProject is stored ", "-joined, so the stored list no longer
+    // splits back into that name.
+    const day = wakaRow("2026-09-12", [
+      { name: "Beta, Acme-Prod-Optimization", total_seconds: 2 * 3600 },
+      { name: "Acme-Prod-Optimization", total_seconds: 3600 },
+    ]);
+    mockIssueFindMany.mockResolvedValue([
+      localIssue("w1", 93, "Week 37 Acme Support", ["Acme-Prod-Optimization"]),
+    ]);
+    mockWakaFindMany.mockResolvedValue([day]);
+    mockTimeEntryFindMany.mockResolvedValue([]);
+    await applyTimeEntries(USER_ID, { start: "2026-09-12", end: "2026-09-12" });
+    const stored = mockTimeEntryCreate.mock.calls[0][0].data.wakaTimeProject as string;
+
+    // The link moves to next week's instance; the same day is still in the window.
+    thisWeekHoldsTheLink();
+    mockTimeEntryFindMany.mockResolvedValue([loggedOn(lastWeek, { project: stored })]);
+
+    const result = await correlateWakaTime(USER_ID, { start: "2026-09-12", end: "2026-09-12" });
+
+    expect(result.matched.map((m) => m.ticketId)).toEqual(["w1"]);
+    expect(result.matched[0].perDay).toEqual([{ date: "2026-09-12", seconds: 3 * 3600 }]);
+  });
+
+  it("does not let two neighbouring logged projects claim a different project whose name joins them", async () => {
+    // "foo" and "bar" logged together on last week's ticket must not own
+    // "foo-bar" (both normalize to "foobar").
+    mockIssueFindMany.mockResolvedValue([localIssue("w2", 99, "Foo Bar", ["foo-bar"])]);
+    mockWakaFindMany.mockResolvedValue([wakaRow("2026-09-12", [{ name: "foo-bar", total_seconds: 3600 }])]);
+    mockTimeEntryFindMany.mockResolvedValue([loggedOn(lastWeek, { project: "foo, bar" })]);
+
+    const result = await correlateWakaTime(USER_ID, { start: "2026-09-12", end: "2026-09-12" });
+
+    expect(result.matched.map((m) => m.ticketId)).toEqual(["w2"]);
+  });
+
+  it("records projects that joined the day since the entry was first logged", async () => {
+    // Logged in the morning with one project; by evening the day has a second
+    // name. If the stored list kept only the first one, the second would have
+    // no owner once the link moves on.
+    mockIssueFindMany.mockResolvedValue([
+      localIssue("w1", 93, "Week 37 Acme Support", ["Acme-Prod-Optimization"]),
+    ]);
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-09-12", [
+        { name: "Acme-Prod-Optimization", total_seconds: 3600 },
+        { name: "Beta, Acme-Prod-Optimization", total_seconds: 2 * 3600 },
+      ]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([loggedOn(lastWeek, { id: "te-w1", hours: 1 })]);
+
+    const result = await applyTimeEntries(USER_ID, { start: "2026-09-12", end: "2026-09-12" });
+
+    expect(result.updated).toBe(1);
+    expect(mockTimeEntryUpdateMany).toHaveBeenCalledWith({
+      where: { id: "te-w1", hours: 1 },
+      data: { hours: 3, wakaTimeProject: "Acme-Prod-Optimization, Beta, Acme-Prod-Optimization" },
+    });
   });
 
   it("ignores legacy entries with no wakaTimeProject for ownership", async () => {
