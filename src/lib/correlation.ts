@@ -35,7 +35,8 @@ export type CorrelationRow = {
   alreadyLoggedDates: string[];
   existingEntriesByDate: Record<string, ExistingWakaEntry>;
   // WakaTime project names that rolled into each day, sorted — stored on the
-  // TimeEntry as wakaTimeProject so later runs know who owns that project-day.
+  // TimeEntry as wakaTimeProject (a JSON array; a name can contain ", ") so
+  // later runs know who owns that project-day.
   projectsByDate: Record<string, string[]>;
 };
 
@@ -87,6 +88,20 @@ export function normalizeProjectName(name: string | null | undefined): string {
   const parts = name.split("/");
   const segment = parts.length > 1 ? parts[parts.length - 1] : name;
   return segment.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+/**
+ * Read a TimeEntry.wakaTimeProject written as a JSON array of WakaTime project
+ * names. Returns null for the older ", "-joined form, which the caller splits.
+ */
+function parseProjectList(stored: string): string[] | null {
+  if (!stored.startsWith("[")) return null;
+  try {
+    const parsed: unknown = JSON.parse(stored);
+    return Array.isArray(parsed) && parsed.every((n) => typeof n === "string") ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -272,29 +287,37 @@ export async function correlateWakaTime(
   // Earliest entry wins where a project-day is already duplicated, so the
   // owner is stable across runs (and matches the cleanup's keep rule).
   const ownerByProjectDay = new Map<string, TicketMatch>();
-  // A WakaTime project name can itself contain ", ", so the stored list
-  // doesn't split back into the names it was built from. Every run of two or
-  // more consecutive parts is registered here too: joining keeps a name like
-  // "A, B" as a consecutive run, so it still finds its ticket. Only names
-  // containing ", " look here, because normalizing drops the separator and
-  // "foo, bar" would otherwise claim an unrelated "foo-bar".
+  // Owners of WakaTime names that contain ", ". Only those names look here,
+  // because normalizing drops the separator and "foo, bar" would otherwise
+  // claim an unrelated "foo-bar".
   const compoundOwnerByProjectDay = new Map<string, TicketMatch>();
+  const claim = (name: string, e: (typeof existingEntries)[number], owners: Map<string, TicketMatch>) => {
+    const key = `${normalizeProjectName(name)}:${e.wakaTimeDate}`;
+    if (owners.has(key)) return;
+    owners.set(key, {
+      ticket: e.issue,
+      link: { id: "logged", repositoryFullName: name, url: "" },
+    });
+  };
   const byCreation = existingEntries
     .filter((e) => e.wakaTimeProject)
     .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id));
   for (const e of byCreation) {
     if (!e.wakaTimeProject) continue;
+    const names = parseProjectList(e.wakaTimeProject);
+    if (names) {
+      for (const name of names) claim(name, e, name.includes(", ") ? compoundOwnerByProjectDay : ownerByProjectDay);
+      continue;
+    }
+    // Legacy ", "-joined list. A name containing ", " can't be split back
+    // out, so every run of two or more consecutive parts is registered too:
+    // joining keeps a name like "A, B" as a consecutive run. A single part of
+    // such a name still claims a project of that name; only the JSON form
+    // avoids that.
     const parts = e.wakaTimeProject.split(", ");
     for (let i = 0; i < parts.length; i++) {
       for (let j = i + 1; j <= parts.length; j++) {
-        const name = parts.slice(i, j).join(", ");
-        const owners = j - i === 1 ? ownerByProjectDay : compoundOwnerByProjectDay;
-        const key = `${normalizeProjectName(name)}:${e.wakaTimeDate}`;
-        if (owners.has(key)) continue;
-        owners.set(key, {
-          ticket: e.issue,
-          link: { id: "logged", repositoryFullName: name, url: "" },
-        });
+        claim(parts.slice(i, j).join(", "), e, j - i === 1 ? ownerByProjectDay : compoundOwnerByProjectDay);
       }
     }
   }
@@ -569,7 +592,8 @@ export async function applyTimeEntries(
 
       const hours = Math.round((day.seconds / 3600) * 100) / 100;
       const existing = row.existingEntriesByDate[day.date];
-      const dayProjects = row.projectsByDate[day.date]?.join(", ");
+      const dayNames = row.projectsByDate[day.date];
+      const dayProjects = dayNames ? JSON.stringify(dayNames) : undefined;
 
       if (existing) {
         const delta = hours - existing.hours;

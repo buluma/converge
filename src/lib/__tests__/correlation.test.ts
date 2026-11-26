@@ -532,7 +532,7 @@ describe("applyTimeEntries", () => {
     // below) instead of double-incrementing spentHours.
     expect(mockTimeEntryUpdateMany).toHaveBeenCalledWith({
       where: { id: "te-1", hours: 1 },
-      data: { hours: 2, wakaTimeProject: "SL2" },
+      data: { hours: 2, wakaTimeProject: '["SL2"]' },
     });
     expect(mockIssueUpdate).toHaveBeenCalledWith({
       where: { id: "t1" },
@@ -581,7 +581,7 @@ describe("applyTimeEntries", () => {
     expect(result.updated).toBe(1);
     expect(mockTimeEntryUpdateMany).toHaveBeenCalledWith({
       where: { id: "te-1", hours: 1 },
-      data: { hours: 2, wakaTimeProject: "SL2" },
+      data: { hours: 2, wakaTimeProject: '["SL2"]' },
     });
   });
 
@@ -959,7 +959,7 @@ describe("project-day ownership across tickets", () => {
     const result = await applyTimeEntries(USER_ID, { start: "2026-09-12", end: "2026-09-12" });
 
     expect(result.updated).toBe(1);
-    expect(mockTimeEntryUpdateMany).toHaveBeenCalledWith({ where: { id: "te-w1", hours: 3 }, data: { hours: 4, wakaTimeProject: "Acme-Prod-Optimization" } });
+    expect(mockTimeEntryUpdateMany).toHaveBeenCalledWith({ where: { id: "te-w1", hours: 3 }, data: { hours: 4, wakaTimeProject: '["Acme-Prod-Optimization"]' } });
     expect(mockTimeEntryCreate).not.toHaveBeenCalled();
   });
 
@@ -1047,8 +1047,54 @@ describe("project-day ownership across tickets", () => {
     expect(result.updated).toBe(1);
     expect(mockTimeEntryUpdateMany).toHaveBeenCalledWith({
       where: { id: "te-w1", hours: 1 },
-      data: { hours: 3, wakaTimeProject: "Acme-Prod-Optimization, Beta, Acme-Prod-Optimization" },
+      data: { hours: 3, wakaTimeProject: '["Acme-Prod-Optimization","Beta, Acme-Prod-Optimization"]' },
     });
+  });
+
+  it("still finds the owner of a \", \" name in a legacy comma-joined list", async () => {
+    // Rows written before the JSON form: "Beta, Acme-Prod-Optimization" and
+    // "Acme-Prod-Optimization" joined into one string.
+    thisWeekHoldsTheLink();
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-09-12", [
+        { name: "Beta, Acme-Prod-Optimization", total_seconds: 2 * 3600 },
+        { name: "Acme-Prod-Optimization", total_seconds: 3600 },
+      ]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([
+      loggedOn(lastWeek, { project: "Acme-Prod-Optimization, Beta, Acme-Prod-Optimization" }),
+    ]);
+
+    const result = await correlateWakaTime(USER_ID, { start: "2026-09-12", end: "2026-09-12" });
+
+    expect(result.matched.map((m) => m.ticketId)).toEqual(["w1"]);
+  });
+
+  it("keeps a project that is only part of another logged name with its own ticket", async () => {
+    // "photo-indexer, SL2" is one WakaTime project. Logged first on the
+    // photo-indexer ticket, it must not make that ticket own "SL2".
+    const indexer = { ...lastWeek, id: "x1", localIssueNumber: 95, subject: "photo-indexer" };
+    mockIssueFindMany.mockResolvedValue([
+      localIssue("x1", 95, "photo-indexer", ["buluma/photo-indexer"]),
+      localIssue("s1", 146, "Week 47 Support", ["buluma/SL2"]),
+    ]);
+    mockWakaFindMany.mockResolvedValue([
+      wakaRow("2026-09-12", [
+        { name: "SL2", total_seconds: 5 * 3600 },
+        { name: "photo-indexer", total_seconds: 3 * 3600 },
+        { name: "photo-indexer, SL2", total_seconds: 6 },
+      ]),
+    ]);
+    mockTimeEntryFindMany.mockResolvedValue([
+      loggedOn(indexer, { id: "te-x1", project: '["photo-indexer","photo-indexer, SL2"]', createdAt: "2026-09-12T03:00:01.975Z" }),
+      loggedOn({ ...lastWeek, id: "s1", localIssueNumber: 146 }, { id: "te-s1", project: '["SL2"]', createdAt: "2026-09-12T03:00:01.996Z" }),
+    ]);
+
+    const result = await correlateWakaTime(USER_ID, { start: "2026-09-12", end: "2026-09-12" });
+
+    const byTicket = Object.fromEntries(result.matched.map((m) => [m.ticketId, m]));
+    expect(byTicket.s1.perDay).toEqual([{ date: "2026-09-12", seconds: 5 * 3600 }]);
+    expect(byTicket.x1.perDay).toEqual([{ date: "2026-09-12", seconds: 3 * 3600 + 6 }]);
   });
 
   it("ignores legacy entries with no wakaTimeProject for ownership", async () => {
@@ -1079,11 +1125,11 @@ describe("project-day ownership across tickets", () => {
     await applyTimeEntries(USER_ID, { start: "2026-09-12", end: "2026-09-13" });
 
     expect(mockTimeEntryCreate).toHaveBeenCalledWith({
-      data: expect.objectContaining({ wakaTimeDate: "2026-09-12", wakaTimeProject: "odysseus, redmine-dashboard" }),
+      data: expect.objectContaining({ wakaTimeDate: "2026-09-12", wakaTimeProject: '["odysseus","redmine-dashboard"]' }),
     });
     // Per day, not every project the ticket saw across the whole window.
     expect(mockTimeEntryCreate).toHaveBeenCalledWith({
-      data: expect.objectContaining({ wakaTimeDate: "2026-09-13", wakaTimeProject: "odysseus" }),
+      data: expect.objectContaining({ wakaTimeDate: "2026-09-13", wakaTimeProject: '["odysseus"]' }),
     });
   });
 });
