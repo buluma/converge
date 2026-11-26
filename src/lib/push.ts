@@ -1,4 +1,4 @@
-import webpush from "web-push";
+import { sendNotification, setVapidDetails } from "web-push";
 import { env } from "./env";
 import { prisma } from "./db";
 import { trackInfo, trackFailure } from "./telemetry";
@@ -6,7 +6,7 @@ import { trackInfo, trackFailure } from "./telemetry";
 // Initialize VAPID only when keys are present
 const vapidConfigured = Boolean(env.vapidPublicKey && env.vapidPrivateKey);
 if (vapidConfigured) {
-  webpush.setVapidDetails(env.pushContact, env.vapidPublicKey, env.vapidPrivateKey);
+  setVapidDetails(env.pushContact, env.vapidPublicKey, env.vapidPrivateKey);
 }
 
 interface PushNotificationOptions {
@@ -40,7 +40,7 @@ export async function sendPushNotification(
   const results = await Promise.allSettled(
     subscriptions.map(async (sub) => {
       try {
-        await webpush.sendNotification(
+        await sendNotification(
           {
             endpoint: sub.endpoint,
             keys: {

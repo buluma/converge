@@ -19,10 +19,8 @@ declare module "web-push" {
     proxy?: string;
   }
 
-  const webPush: {
-    setVapidDetails(subject: string, publicKey: string, privateKey: string): void;
-    sendNotification(subscription: PushSubscription, payload?: string, options?: WebPushOptions): Promise<void>;
-    generateVAPIDKeys(): { publicKey: string; privateKey: string };
-  };
-  export default webPush;
+  // web-push 4 is ESM with named exports only; there is no default export.
+  export function setVapidDetails(subject: string, publicKey: string, privateKey: string): void;
+  export function sendNotification(subscription: PushSubscription, payload?: string, options?: WebPushOptions): Promise<void>;
+  export function generateVAPIDKeys(): { publicKey: string; privateKey: string };
 }
