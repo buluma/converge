@@ -19,6 +19,20 @@ bun-debug.log*
 # Environment
 .env.local
 .env.*.local
+# Every local env file (and copies of one) stays out of the image; the
+# container gets its environment at runtime. NEXT_PUBLIC_* values the build
+# inlines come in as build args (see the Dockerfile).
+.env
+.env.*
+!.env.example
+
+# Machine-local data and history
+backups
+.git
+
+# Generated in the image from the selected schema; a local copy would
+# overwrite it
+src/generated
 
 # IDE
 .idea

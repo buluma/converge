@@ -31,7 +31,19 @@ ENV NEXT_TELEMETRY_DISABLED 1
 # Skip TypeScript type checking (fix type errors separately)
 RUN sed -i 's/const nextConfig: NextConfig = { output: "standalone",/const nextConfig: NextConfig = { output: "standalone", typescript: { ignoreBuildErrors: true },/' next.config.ts
 
-RUN bun run build
+# Same as Dockerfile: .env files are not in the build context, so NEXT_PUBLIC_*
+# values come in as build args and env.ts gets throwaway values for this step.
+ARG NEXT_PUBLIC_APP_URL
+ARG NEXT_PUBLIC_SENTRY_DSN
+ARG NEXT_PUBLIC_SENTRY_ENABLE_LOGS
+ARG NEXT_PUBLIC_VAPID_PUBLIC_KEY
+RUN for v in NEXT_PUBLIC_APP_URL NEXT_PUBLIC_SENTRY_DSN NEXT_PUBLIC_SENTRY_ENABLE_LOGS NEXT_PUBLIC_VAPID_PUBLIC_KEY; do \
+      eval "[ -n \"\${$v}\" ] || unset $v"; \
+    done && \
+    export DATABASE_URL="file:./build.db" \
+      APP_ENCRYPTION_KEY="$(head -c 32 /dev/urandom | base64)" \
+      SESSION_SECRET="$(head -c 32 /dev/urandom | base64)" && \
+    bun run build
 
 # Production image
 FROM base AS runner
