@@ -100,6 +100,8 @@ The application will be available at [http://localhost:3000](http://localhost:30
 A Docker setup is provided for a containerized development environment. For more details, see
 [DOCKER.md](../DOCKER.md).
 
+Docker images run on PostgreSQL only. SQLite needs the native `better-sqlite3` addon behind the Prisma 7 adapter, and the images run on Bun, which cannot load it, so the `Dockerfile` refuses to build with the SQLite schema. SQLite still works for local development outside Docker.
+
 ### Quick Start
 
 1. **Configure Environment:** Copy the `.env.example` file to `.env`. `make up` starts the PostgreSQL-backed stack (`docker-compose.yml`'s `dashboard` service reads `DOCKER_POSTGRES_DATABASE_URL`), so that's the connection string that matters here — `DOCKER_DATABASE_URL` isn't referenced by the current Compose setup at all.
@@ -127,19 +129,19 @@ If you want Docker to run on a local Postgres copy of Supabase data:
    unset SUPABASE_DATABASE_URL
    ```
    The importer excludes Supabase-managed extension objects (`pg_graphql`, `supabase_vault`) during restore.
-2. Start Postgres-mode stack: ```bash
-   make up-pg ```
+2. Start the stack: ```bash
+   make up ```
 3. Tail logs: ```bash
-   make logs-pg ```
-4. Stop Postgres-mode stack: ```bash
-   make down-pg ```
+   make logs ```
+4. Stop the stack: ```bash
+   make down ```
 
 A full list of helper targets is available in the [Makefile](../Makefile).
 
 ## Environment Variables Reference
 
 - `DATABASE_URL`: SQLite file path for local development (default: `file:./prisma/dev.db`). If regenerating Prisma for this mode, run `bun run prisma:generate:sqlite`; `bun run prisma:generate` generates the PostgreSQL client.
-- `DOCKER_DATABASE_URL`: not referenced by the current `docker-compose.yml` — the dashboard service reads `DOCKER_POSTGRES_DATABASE_URL` instead. Left here only in case a future SQLite-mode Compose file reintroduces it.
+- `DOCKER_DATABASE_URL`: not referenced by the current `docker-compose.yml` — the dashboard service reads `DOCKER_POSTGRES_DATABASE_URL` instead. Docker images are Postgres-only, so there is no SQLite-mode Compose setup that would use it.
 - `DOCKER_POSTGRES_DB`: Local Docker Postgres DB name.
 - `DOCKER_POSTGRES_USER`: Local Docker Postgres username.
 - `DOCKER_POSTGRES_PASSWORD`: Local Docker Postgres password.
