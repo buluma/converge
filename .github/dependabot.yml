@@ -26,7 +26,7 @@ updates:
       - dependency-name: "@sentry/*"
         versions: [">= 11.13.0"]
 
-  # Dockerfile / Dockerfile.pi base images
+  # Dockerfile base image
   - package-ecosystem: "docker"
     directory: "/"
     schedule:

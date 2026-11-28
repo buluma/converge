@@ -18,7 +18,7 @@ case "$DATABASE_URL_VALUE" in
       echo "" >&2
       echo "Prisma migrate deploy failed — refusing to start against an unknown schema." >&2
       echo "If this is a brand-new database with no migration history (e.g. a fresh" >&2
-      echo "'make up-pg' volume, or one that was set up with 'prisma db push'), baseline" >&2
+      echo "'make up' volume, or one that was set up with 'prisma db push'), baseline" >&2
       echo "it once — see docs/POSTGRES_MIGRATION.md step 5:" >&2
       echo "  npx prisma db push --accept-data-loss" >&2
       echo "  for d in prisma/migrations/*/; do npx prisma migrate resolve --applied \"\$(basename \"\$d\")\"; done" >&2

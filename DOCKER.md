@@ -31,6 +31,10 @@ make logs
 make down
 ```
 
+## Database
+
+Docker images run on PostgreSQL only. SQLite needs the native `better-sqlite3` addon behind the Prisma 7 adapter, and the images run on Bun, which cannot load it, so the `Dockerfile` refuses to build with the SQLite schema. SQLite still works for local development outside Docker.
+
 ## Migrating from SQLite to PostgreSQL
 
 For Pi homelab installs that started on SQLite, see
@@ -49,28 +53,27 @@ make import-supabase SUPABASE_DATABASE_URL="postgresql://user:pass@host:5432/pos
 
 Note: the import flow excludes Supabase-managed extension objects (`pg_graphql`, `supabase_vault`) so restore works on standard Postgres images.
 
-2. Start the Postgres-mode stack:
+2. Start the stack:
 
 ```bash
-make up-pg
+make up
 ```
 
 3. Tail logs:
 
 ```bash
-make logs-pg
+make logs
 ```
 
-4. Stop Postgres-mode stack:
+4. Stop the stack:
 
 ```bash
-make down-pg
+make down
 ```
 
 ## Data Persistence
 
-- SQLite DB path in container: `file:./prisma/dev.db`
-- Host bind mount: `./prisma -> /app/prisma`
+- Postgres data lives in the `postgres-data` named volume.
 - Result: issue cache and sync state survive container recreation.
 
 ## Common Commands
@@ -112,10 +115,11 @@ make help
 
 ## Reset Local Docker Data
 
-To reset only SQLite cache/state:
+To wipe the Postgres volume and start fresh (destructive — this deletes all data in the `postgres-data` volume):
 
 ```bash
-make reset-db
+docker compose down -v
+make up
 ```
 
 To reset containers/networks:

@@ -1,7 +1,15 @@
 FROM oven/bun:1-alpine
 
 WORKDIR /app
-ARG PRISMA_SCHEMA=prisma/schema.dev.sqlite.prisma
+ARG PRISMA_SCHEMA=prisma/schema.prisma
+# Postgres is the only database this image supports. SQLite needs the native
+# better-sqlite3 addon behind the Prisma 7 adapter, and Bun refuses to load it
+# ("not yet supported in Bun"), so a SQLite image would build and then fail at
+# runtime. Fail the build instead. SQLite still works for local dev outside Docker.
+RUN if [ "$PRISMA_SCHEMA" != "prisma/schema.prisma" ]; then \
+      echo "Unsupported PRISMA_SCHEMA=$PRISMA_SCHEMA: Docker images are Postgres-only (prisma/schema.prisma)" >&2; \
+      exit 1; \
+    fi
 
 # Install dependencies for native modules
 RUN apk add --no-cache sqlite openssl ca-certificates python3 make g++ libstdc++
@@ -13,9 +21,6 @@ COPY prisma ./prisma
 COPY patches ./patches
 RUN bun install --frozen-lockfile --ignore-scripts
 COPY prisma.config.ts ./prisma.config.ts
-# No native better-sqlite3 build here: the image runs on Bun, which refuses to load
-# better-sqlite3 ("not yet supported in Bun"), so SQLite mode cannot work in this
-# image with the Prisma 7 better-sqlite3 adapter. Postgres builds never load it.
 
 # Copy Prisma schema
 COPY prisma ./prisma
@@ -38,17 +43,15 @@ ARG NEXT_PUBLIC_VAPID_PUBLIC_KEY
 # variables env.ts requires at import get throwaway values generated for this
 # step only; real values come from the container environment at runtime.
 # Prisma 7 rejects a DATABASE_URL whose driver does not match the generated
-# client, so Postgres builds get a placeholder Postgres URL. The build never
+# client, so the build gets a placeholder Postgres URL. The build never
 # connects.
 RUN for v in NEXT_PUBLIC_APP_URL NEXT_PUBLIC_SENTRY_DSN NEXT_PUBLIC_SENTRY_ENABLE_LOGS NEXT_PUBLIC_VAPID_PUBLIC_KEY; do \
       eval "[ -n \"\${$v}\" ] || unset $v"; \
     done && \
-    export DATABASE_URL="file:./build.db" \
+    export DATABASE_URL="postgresql://build:build@localhost:5432/build" \
       APP_ENCRYPTION_KEY="$(head -c 32 /dev/urandom | base64)" \
       SESSION_SECRET="$(head -c 32 /dev/urandom | base64)" && \
-    if [ "$PRISMA_SCHEMA" = "prisma/schema.prisma" ]; then \
-      export DATABASE_URL="postgresql://build:build@localhost:5432/build"; \
-    fi && bun run build
+    bun run build
 
 # Copy public assets and static chunks into standalone output so they are served
 RUN cp -r public .next/standalone/public && \

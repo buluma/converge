@@ -61,7 +61,7 @@ DOCKER_POSTGRES_PASSWORD=<change-me>
 DOCKER_POSTGRES_PORT=5433
 DOCKER_POSTGRES_DATABASE_URL=postgresql://converge:<change-me>@postgres:5432/converge
 ENV
-make up-pg
+make up
 ```
 
 Compose forces the dashboard *container's* `DATABASE_URL` / `DIRECT_URL` to `DOCKER_POSTGRES_DATABASE_URL`, which points at the Postgres service by its Docker-network hostname (`postgres:5432`) — that hostname only resolves inside the Compose network. Anything run from the host directly (`psql`, a local Prisma CLI, `scripts/sqlite-to-postgres-copy.py` invoked outside a container) needs the host-reachable DSN instead: `postgresql://converge:<change-me>@localhost:${DOCKER_POSTGRES_PORT:-5433}/converge`.
@@ -114,13 +114,14 @@ docker compose exec postgres \
 
 8. **Rollback** (if needed)
 
+Rolling back to a SQLite container is no longer possible: since Prisma 7 the Docker images are Postgres-only, because SQLite needs the native `better-sqlite3` addon and Bun cannot load it. To roll back, run the app outside Docker against the SQLite snapshot:
+
 ```bash
-make down-pg
+make down
 mv .env.sqlite.bak .env
-make up
 ```
 
-The SQLite cache snapshot from step 2 is at `backups/sqlite_backup_<timestamp>.db.gz` — restore by `gunzip`-ing it and copying the result over `prisma/dev.db` before `make up` if the bind mount wiped it.
+The SQLite cache snapshot from step 2 is at `backups/sqlite_backup_<timestamp>.db.gz` — restore by `gunzip`-ing it and copying the result over `prisma/dev.db`, then start the app locally with `bun run dev` (or a production build).
 
 ## Strategy B — Carry over local-only data
 
