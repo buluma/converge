@@ -48,7 +48,7 @@
     "@sentry/profiling-node": "11.12.0",
     "ajv": "^8.20.0",
     "@scalar/swagger-editor": "^1.0.2",
-    "@serwist/next": "^9.5.7",
+    "@serwist/next": "^9.6.0",
     "@slack/web-api": "^8.4.0",
     "@tanstack/react-virtual": "^3.13.24",
     "@upstash/redis": "^1.37.0",
