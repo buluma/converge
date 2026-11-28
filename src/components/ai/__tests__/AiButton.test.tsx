@@ -1,10 +1,25 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+import { render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
 import { AiButton } from "@/src/components/ai/AiButton";
 
 describe("AiButton component", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  // A test that ends while a click is still loading leaves handleClick's
+  // setIsLoading(false) pending. If it fires after the file's jsdom is torn
+  // down, React throws "window is not defined" as an unhandled rejection and
+  // fails the run. Every test must wait for its click to finish.
+  // cleanup() in finally: a failing hook would otherwise skip Testing
+  // Library's auto-cleanup and leak this test's DOM into the next ones.
+  afterEach(() => {
+    try {
+      expect(screen.queryByText("AI thinking...")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("custom-loader")).not.toBeInTheDocument();
+    } finally {
+      cleanup();
+    }
   });
 
   it("renders with children and spark icon", () => {
@@ -20,6 +35,7 @@ describe("AiButton component", () => {
     fireEvent.click(button);
 
     expect(handleClick).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(button).not.toBeDisabled());
   });
 
   it("shows loading state while async operation in progress", async () => {
@@ -54,6 +70,7 @@ describe("AiButton component", () => {
     await waitFor(() => {
       expect(button).toBeDisabled();
     });
+    await waitFor(() => expect(button).not.toBeDisabled());
   });
 
   it("respects disabled prop", () => {
@@ -164,6 +181,8 @@ describe("AiButton component", () => {
     await waitFor(() => {
       expect(screen.getByTestId("custom-loader")).toBeInTheDocument();
     });
+    // The loader replaces the button; it comes back once the click finishes.
+    await waitFor(() => expect(screen.getByText("Summarize")).toBeInTheDocument());
   });
 
   it("applies custom className", () => {
@@ -189,5 +208,6 @@ describe("AiButton component", () => {
 
     // Only first click should proceed
     expect(handleClick).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(button).not.toBeDisabled());
   });
 });
