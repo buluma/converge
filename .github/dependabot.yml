@@ -25,6 +25,12 @@ updates:
       # at runtime. Hold at 11.12 until that is solved.
       - dependency-name: "@sentry/*"
         versions: [">= 11.13.0"]
+      # typescript-eslint 8 supports only typescript <6.0.0. Under TypeScript 7
+      # (the native Go port) lint crashes inside @typescript-eslint/typescript-estree
+      # ("Cannot read properties of undefined (reading 'Cjs')"). Hold at 5.x
+      # until typescript-eslint supports it.
+      - dependency-name: "typescript"
+        versions: [">= 6.0.0"]
 
   # Dockerfile base image
   - package-ecosystem: "docker"
